@@ -1,0 +1,9 @@
+# The filled-in profile: it holds your host, port, user and domains.
+# Only profile.example.conf, which is empty, belongs in the repo.
+profile.conf
+
+# Collected bundles and written reports: a map of your ports, containers,
+# mounts, accounts and paths. Never commit these anywhere.
+audit-output/
+bundle*.txt
+*.part

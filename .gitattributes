@@ -1,0 +1,5 @@
+# These scripts are written on Windows and run on Linux and macOS. Without this
+# they would be stored with Windows line endings, and there they fail on the
+# first line with "bash: $'\r': command not found".
+*.sh   text eol=lf
+*.conf text eol=lf
