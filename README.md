@@ -86,7 +86,7 @@ $EDITOR ~/.config/audit-skills/profile.conf
 | `SSH_HOST` | Hostname or IP of the machine you audit. |
 | `SSH_PORT` | SSH port, 22 if left out. |
 | `SSH_USER` | Login user. Passwordless sudo, or the privileged sections come back as NOT VERIFIED, which is the honest answer. |
-| `ALLOWED_DOMAINS` | Space separated list of the domains you own. Any target outside it is refused. |
+| `WEB_TARGETS` | Space separated list of the hosts to audit, each written out in full. Any target outside it is refused. A bare domain covers itself and nothing else: `radlab.it` does not cover `www.radlab.it`. |
 | `OUTPUT_DIR` | Where bundles and reports are written, `./audit-output` by default. |
 
 The example file ships every value empty. An empty value, or one still holding

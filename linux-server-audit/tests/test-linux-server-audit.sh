@@ -102,7 +102,7 @@ trap 'rm -rf "$t"' EXIT
 # The wrapper is always called in profile-check mode and with a clean
 # environment, so a test can never open a connection to anything.
 profile_check() {   # profile_check <profile path>
-  env -u SSH_HOST -u SSH_USER -u SSH_PORT -u OUTPUT_DIR -u ALLOWED_DOMAINS \
+  env -u SSH_HOST -u SSH_USER -u SSH_PORT -u OUTPUT_DIR -u WEB_TARGETS \
       AUDIT_PROFILE="$1" bash "$RUNNER" --check-profile 2>&1
 }
 profile_rc() {   # profile_rc <profile path>
@@ -115,25 +115,180 @@ out="$(profile_check "$t/does-not-exist.conf")"
 expect_nonzero 'missing profile: exit code is not zero' "$(profile_rc "$t/does-not-exist.conf")"
 contains 'missing profile: the message names the profile' 'no audit profile found' "$out"
 
-printf 'SSH_HOST="203.0.113.10"\nSSH_USER="auditor"\nALLOWED_DOMAINS=""\n' > "$t/empty-domains.conf"
-out="$(profile_check "$t/empty-domains.conf")"
-expect_nonzero 'empty domain list: exit code is not zero' "$(profile_rc "$t/empty-domains.conf")"
-contains 'empty domain list: the message names ALLOWED_DOMAINS' 'ALLOWED_DOMAINS' "$out"
+# An example host is what a profile nobody filled in still carries. The empty
+# WEB_TARGETS is not what stops this one: the server skill does not use that
+# value, and demanding it was asking for the wrong field as proof the form had
+# been completed. SSH_HOST is the field this skill actually needs.
+printf 'SSH_HOST="203.0.113.10"\nSSH_USER="auditor"\nWEB_TARGETS=""\n' > "$t/example-host.conf"
+out="$(profile_check "$t/example-host.conf")"
+expect_nonzero 'a profile still holding an example host: exit code is not zero' \
+  "$(profile_rc "$t/example-host.conf")"
+contains 'a profile still holding an example host: the message says it was never filled in' \
+  'never filled in' "$out"
 
-printf 'SSH_USER="auditor"\nALLOWED_DOMAINS="example.com"\n' > "$t/no-host.conf"
+printf 'SSH_USER="auditor"\nWEB_TARGETS="example.com"\n' > "$t/no-host.conf"
 expect_nonzero 'profile without SSH_HOST: exit code is not zero' "$(profile_rc "$t/no-host.conf")"
 
 # A profile that is really filled in: no documentation address, no reserved
 # example domain. Those are what the example file carries, and a profile still
 # carrying them is a profile nobody ever filled in (see the section below).
-printf 'SSH_HOST="10.9.8.7"\nSSH_PORT="2222"\nSSH_USER="auditor"\nALLOWED_DOMAINS="ourshop.test ourblog.test"\nOUTPUT_DIR="%s/out"\n' "$t" > "$t/good.conf"
+printf 'SSH_HOST="10.9.8.7"\nSSH_PORT="2222"\nSSH_USER="auditor"\nWEB_TARGETS="ourshop.test ourblog.test"\nOUTPUT_DIR="%s/out"\n' "$t" > "$t/good.conf"
 out="$(profile_check "$t/good.conf")"
 expect  'complete profile: exit code is zero'         0 "$(profile_rc "$t/good.conf")"
 contains 'complete profile: the target host is shown' '10.9.8.7' "$out"
 contains 'complete profile: the port is shown'        '2222' "$out"
 contains 'complete profile: the output directory is shown' "$t/out" "$out"
-contains 'complete profile: the allowed domains are shown' 'ourblog.test' "$out"
+contains 'complete profile: the web targets are shown' 'ourblog.test' "$out"
 file_has 'the default profile path is the shared one' 'config/audit-skills/profile.conf' "$RUNNER"
+
+echo
+echo '=== PROFILE: it is data, not a program ==='
+# The profile used to be sourced, so every line in it was a command. A profile
+# copied from a forum, or edited by somebody who did not write it, could run
+# anything with your account, and the file is a form: it should not be able to.
+marker="$t/audit-profile-was-executed"
+rm -f "$marker"
+printf 'SSH_HOST="10.0.0.1"\nSSH_USER="auditor"\nWEB_TARGETS="radlab.it"\ntouch %s\n' "$marker" > "$t/hostile.conf"
+out="$(profile_check "$t/hostile.conf")"
+expect_nonzero 'profile: a line that is not KEY=value is refused' "$(profile_rc "$t/hostile.conf")"
+if [ -e "$marker" ]; then
+  ko=$((ko+1)); printf 'KO    profile: the command inside the profile was executed\n'
+else
+  ok=$((ok+1)); printf 'ok    profile: the command inside the profile was not executed\n'
+fi
+contains 'profile: the message names the offending line' 'touch ' "$out"
+
+printf 'SSH_HOST="10.0.0.1"\nSSH_USER="auditor"\nALLOWED_DOMAINS="radlab.it"\n' > "$t/old.conf"
+out="$(profile_check "$t/old.conf")"
+expect_nonzero 'profile: the old key stops the run' "$(profile_rc "$t/old.conf")"
+contains 'profile: the message says which key replaces it' \
+  'Replace it with WEB_TARGETS and write every host in full' "$out"
+contains 'profile: the message shows the shape of the new line' 'WEB_TARGETS="' "$out"
+contains 'profile: the message says a bare domain no longer covers subdomains' \
+  'A bare domain no longer covers its subdomains' "$out"
+
+printf 'SSH_HOST="10.0.0.1"\nSSH_USER="auditor"\nWEB_TARGETS="radlab.it"\nSSH_KEY="/home/me/.ssh/id_ed25519"\n' > "$t/unknown.conf"
+out="$(profile_check "$t/unknown.conf")"
+expect_nonzero 'profile: an unknown key stops the run' "$(profile_rc "$t/unknown.conf")"
+contains 'profile: the message names the unknown key' 'SSH_KEY' "$out"
+contains 'profile: the message lists the keys that do exist' 'WEB_TARGETS' "$out"
+
+# Comments and blank lines are part of the form, and the quotes around a value
+# are punctuation, not part of the value.
+printf '# our production server\n\nSSH_HOST="10.9.8.7"\nSSH_USER="auditor"\nWEB_TARGETS="a.test b.test"\nOUTPUT_DIR="%s/out"\n' "$t" > "$t/comments.conf"
+out="$(profile_check "$t/comments.conf")"
+expect 'profile: comments and blank lines are ignored' 0 "$(profile_rc "$t/comments.conf")"
+contains 'profile: the value arrives without its quotes' '10.9.8.7' "$out"
+lacks 'profile: the quotes are not part of the host' '"10.9.8.7"' "$out"
+contains 'profile: the web targets are shown' 'a.test b.test' "$out"
+
+# Sourcing expanded $HOME for free, and reading the file as data does not. A
+# profile written when it was sourced would now silently write its bundles into
+# a directory literally called "$HOME", and you would go looking for reports
+# that are not where you left them. Refused, with the fix in the message.
+printf 'SSH_HOST="10.9.8.7"\nSSH_USER="auditor"\nWEB_TARGETS="a.test"\nOUTPUT_DIR="$HOME/sync/audit"\n' > "$t/dollar.conf"
+out="$(profile_check "$t/dollar.conf")"
+expect_nonzero 'profile: a value holding a shell variable is refused' "$(profile_rc "$t/dollar.conf")"
+contains 'profile: the message names the offending value' 'OUTPUT_DIR' "$out"
+contains 'profile: the message says how to write it instead' '~/' "$out"
+
+# The tilde is the shortcut people expect, and it expands without executing
+# anything, so it is the one that is kept.
+printf 'SSH_HOST="10.9.8.7"\nSSH_USER="auditor"\nWEB_TARGETS="a.test"\nOUTPUT_DIR="~/sync/audit"\n' > "$t/tilde.conf"
+out="$(profile_check "$t/tilde.conf")"
+expect 'profile: a path starting with a tilde is accepted' 0 "$(profile_rc "$t/tilde.conf")"
+contains 'profile: the tilde becomes the home directory' "$HOME/sync/audit" "$out"
+
+# Quotes are punctuation, and stripping them one end at a time accepts values
+# that were never quoted properly. Sourcing handled a trailing comment
+# correctly; reading as data has to refuse it rather than paste it into the
+# hostname it is about to connect to.
+printf 'SSH_HOST="10.9.8.7"  # prod\nSSH_USER="auditor"\nWEB_TARGETS="a.test"\n' > "$t/comment.conf"
+out="$(profile_check "$t/comment.conf")"
+expect_nonzero 'profile: a value with a trailing comment is refused' "$(profile_rc "$t/comment.conf")"
+lacks 'profile: the broken host never reaches the target line' 'target host:     10.9.8.7"' "$out"
+
+# This repository is written on Windows, so a profile saved there arrives with
+# carriage returns. Left in place they ride along inside the hostname and
+# inside every web target, and every later comparison fails for a reason
+# nothing on screen explains.
+printf 'SSH_HOST="10.9.8.7"\r\nSSH_USER="auditor"\r\nWEB_TARGETS="a.test b.test"\r\n' > "$t/crlf.conf"
+out="$(profile_check "$t/crlf.conf")"
+expect 'profile: a file with Windows line endings is read' 0 "$(profile_rc "$t/crlf.conf")"
+contains 'profile: the host arrives without the carriage return' 'target host:     10.9.8.7' "$out"
+contains 'profile: the targets arrive without it either' 'web targets:     a.test b.test' "$out"
+
+# Sourcing tolerated indentation and blank-looking lines. Refusing them is a
+# regression that fires on a file the user has just edited, with a message that
+# shows an empty line and nothing wrong on it.
+printf 'SSH_HOST="10.9.8.7"\n   \n  SSH_USER="auditor"\nWEB_TARGETS="a.test"  \n' > "$t/spaces.conf"
+out="$(profile_check "$t/spaces.conf")"
+expect 'profile: indentation and whitespace-only lines are tolerated' 0 "$(profile_rc "$t/spaces.conf")"
+contains 'profile: an indented key is still read' 'ssh user:        auditor' "$out"
+contains 'profile: a trailing space does not stay in the value' 'web targets:     a.test' "$out"
+
+# The quote check only fired when a double quote was present, so an unquoted
+# value carried its trailing comment into the hostname the run then connects to.
+# Sourcing handled this correctly, so refusing it is not enough: it has to be
+# refused rather than accepted whole.
+printf 'SSH_HOST=10.9.8.7 # prod\nSSH_USER="auditor"\nWEB_TARGETS="a.test"\n' > "$t/bare-comment.conf"
+out="$(profile_check "$t/bare-comment.conf")"
+expect_nonzero 'profile: an unquoted value with a trailing comment is refused' \
+  "$(profile_rc "$t/bare-comment.conf")"
+lacks 'profile: the comment never reaches the target host' 'target host:     10.9.8.7 #' "$out"
+
+# The profile was a shell file until now, so single quotes are a shape people
+# already have. Kept as part of the value they made the one declared host
+# unreachable, with a rejection message that contradicted the file.
+printf "SSH_HOST='10.9.8.7'\nSSH_USER='auditor'\nWEB_TARGETS='a.test b.test'\n" > "$t/single.conf"
+out="$(profile_check "$t/single.conf")"
+expect 'profile: single quotes are accepted' 0 "$(profile_rc "$t/single.conf")"
+contains 'profile: and stripped from the host' 'target host:     10.9.8.7' "$out"
+contains 'profile: and stripped from the targets' 'web targets:     a.test b.test' "$out"
+
+# Every other profile refusal in these scripts exits 3. A bad line exiting 1
+# broke that contract for no reason.
+expect 'profile: a bad line exits with the same code as the other refusals' \
+  3 "$(profile_rc "$t/hostile.conf")"
+
+echo
+echo '=== BUNDLE: a cut collection never carries the completion marker ==='
+# The body runs inside a pipe now, so a fatal error in it kills the body alone
+# while the marker printed after the pipe still appears. The wrapper uses that
+# marker as its only proof that the collection ran to the end, so a half bundle
+# would be renamed to a complete one and analysed, with a confident coverage
+# line on top of it. The marker is printed by the counter, and only when the
+# body reached its last line.
+cut_body='##### SECTION: FIREWALL
+
+$ sudo -n ufw status
+Status: active
+'
+out="$(printf '%s\n' "$cut_body" | coverage_tee)"
+lacks 'bundle: a body that stopped early gets no completion marker' \
+  'END OF COLLECTION' "$out"
+contains 'bundle: and says the collection was cut instead' 'CUT SHORT' "$out"
+
+whole_body="$cut_body
+##### BODY COMPLETE"
+out="$(printf '%s\n' "$whole_body" | coverage_tee)"
+contains 'bundle: a body that reached the end gets the marker' 'END OF COLLECTION' "$out"
+lacks 'bundle: the internal sentinel does not appear in the bundle' 'BODY COMPLETE' "$out"
+
+# A check that does not apply is not a check that was made: counted as verified
+# it inflates the number the report opens with, and that number is the one the
+# customer reads first.
+na='##### SECTION: PENDING UPDATES
+
+$ apt list --upgradable
+libssl3 upgradable
+
+-- dnf -q check-update --security
+NOT APPLICABLE: dnf is not installed on this machine
+'
+out="$(printf '%s\n' "$na" | coverage_tee)"
+contains 'coverage: a check that does not apply is not counted as verified' \
+  'Coverage: 1 verified, 0 not verified, 6 excluded by contract.' "$out"
 
 echo
 echo '=== COLLECTOR: reboot pending ==='
@@ -629,14 +784,14 @@ echo '=== PROFILE: the example file is a form, not a profile ==='
 # The example file says in writing that the skills refuse to run while it is a
 # stub. That sentence has to be true, or it is the worst kind of documentation:
 # the kind that stops people from checking.
-printf 'SSH_HOST="203.0.113.10"\nSSH_USER="auditor"\nALLOWED_DOMAINS="example.com example.org"\n' > "$t/still-example.conf"
+printf 'SSH_HOST="203.0.113.10"\nSSH_USER="auditor"\nWEB_TARGETS="example.com example.org"\n' > "$t/still-example.conf"
 expect_nonzero 'a profile still holding the example values does not run' "$(profile_rc "$t/still-example.conf")"
 contains 'and the message says the profile was never filled in' 'never filled in' "$(profile_check "$t/still-example.conf")"
-printf 'SSH_HOST="10.9.8.7"\nSSH_USER="auditor"\nALLOWED_DOMAINS="ourshop.test example.com"\n' > "$t/half-example.conf"
+printf 'SSH_HOST="10.9.8.7"\nSSH_USER="auditor"\nWEB_TARGETS="ourshop.test example.com"\n' > "$t/half-example.conf"
 expect_nonzero 'one reserved domain left in the list is enough to stop' "$(profile_rc "$t/half-example.conf")"
 file_has 'the example profile ships an empty host'        'SSH_HOST=""' "$EXAMPLE"
 file_has 'the example profile ships an empty user'        'SSH_USER=""' "$EXAMPLE"
-file_has 'the example profile ships an empty domain list' 'ALLOWED_DOMAINS=""' "$EXAMPLE"
+file_has 'the example profile ships an empty target list' 'WEB_TARGETS=""' "$EXAMPLE"
 file_lacks 'and carries no value that looks already filled in' 'SSH_HOST="[0-9]' "$EXAMPLE"
 
 echo
@@ -831,7 +986,7 @@ contains 'coverage: the section score counts the check once' 'ACCOUNTS (0/1)' "$
 # report on the majority platform, and a permanent hole is one nobody reads.
 absent='##### SECTION: PENDING UPDATES
 
-$ dnf -q check-update --security
+-- dnf -q check-update --security
 NOT APPLICABLE: dnf is not installed on this machine
 
 $ apt list --upgradable
@@ -839,7 +994,7 @@ libssl3/jammy-updates 3.0.2-0ubuntu1.15 amd64 [upgradable from: 3.0.2-0ubuntu1.1
 '
 out="$(printf '%s\n' "$absent" | coverage_tee)"
 contains 'coverage: an absent tool is answered, not counted as a gap' \
-  'Coverage: 2 verified, 0 not verified, 6 excluded by contract.' "$out"
+  'Coverage: 1 verified, 0 not verified, 6 excluded by contract.' "$out"
 lacks 'coverage: an absent tool does not open a permanent gap' 'Sections with gaps' "$out"
 
 if command -v sh >/dev/null 2>&1; then

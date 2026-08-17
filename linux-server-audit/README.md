@@ -36,8 +36,13 @@ cp profile.example.conf ~/.config/audit-skills/profile.conf
 $EDITOR ~/.config/audit-skills/profile.conf
 ```
 
-Keys: `SSH_HOST`, `SSH_PORT` (default 22), `SSH_USER`, `ALLOWED_DOMAINS` (space
-separated, your own domains), `OUTPUT_DIR` (default `./audit-output`).
+Keys: `SSH_HOST`, `SSH_PORT` (default 22), `SSH_USER`, `WEB_TARGETS` (space
+separated, every host written in full, no implicit subdomains), `OUTPUT_DIR`
+(default `./audit-output`).
+
+The file is read as data, never executed: a line that is not one of those keys
+stops the run and names the line. Any other key is refused rather than ignored,
+so a typo cannot leave you auditing a default you did not choose.
 
 Set `AUDIT_PROFILE` to use a different file, for example one profile per
 machine:

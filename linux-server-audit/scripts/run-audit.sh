@@ -75,33 +75,140 @@ profile_is_example() {   # <value ...>
   return 1
 }
 
+# The profile is a form, and a form is data.
+#
+# It used to be sourced, which made every line in it a command: a profile
+# copied from somewhere else, or edited by somebody who did not write it, ran
+# with your account and your keys, and nothing in the file warned you. Here each
+# line is parsed, the key has to be one of a closed list, and anything else stops
+# the run naming the line that is wrong.
+#
+# It prints the pairs rather than assigning them, so the caller decides what to
+# do with each one and this function stays something the tests can feed by hand.
+AUDIT_PROFILE_KEYS='SSH_HOST SSH_PORT SSH_USER WEB_TARGETS OUTPUT_DIR'
+
+read_profile() {   # read_profile <path>
+  local line key value known k
+  while IFS= read -r line || [ -n "$line" ]; do
+    # Trimmed at both ends before anything else. This covers three shapes that
+    # sourcing accepted and parsing would otherwise refuse on a file somebody
+    # just edited: an indented key, a line holding only spaces, and the carriage
+    # return a profile saved on Windows carries. Left in place, that carriage
+    # return rides along inside the hostname and inside every target, and every
+    # comparison downstream fails for a reason nothing on screen explains.
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    case "$line" in
+      ''|'#'*) continue ;;
+    esac
+    case "$line" in
+      *=*) ;;
+      *) stop "this line in $1 is not a KEY=value line:" \
+              "  $line" \
+              "The profile is a form, not a script: only KEY=\"value\" lines are read," \
+              "and nothing in it is ever executed." ;;
+    esac
+    key="${line%%=*}"
+    value="${line#*=}"
+    # The old key gets its own message: it is the one change in this release
+    # that breaks a file people already have, so the message has to be enough
+    # to fix it without opening any documentation.
+    if [ "$key" = "ALLOWED_DOMAINS" ]; then
+      stop "This profile uses ALLOWED_DOMAINS, which no longer exists." \
+           "Replace it with WEB_TARGETS and write every host in full, separated by spaces:" \
+           "" \
+           "  WEB_TARGETS=\"radlab.it www.radlab.it quarantotto.menulampo.it\"" \
+           "" \
+           "A bare domain no longer covers its subdomains: every host you want audited" \
+           "must be written out. Nothing was collected."
+    fi
+    case "$key" in
+      *[!A-Z_]*) stop "this line in $1 has a key that is not a plain name:" "  $line" ;;
+    esac
+    known=0
+    for k in $AUDIT_PROFILE_KEYS; do [ "$key" = "$k" ] && known=1; done
+    [ "$known" -eq 1 ] || stop "unknown key in $1:" \
+      "  $line" \
+      "Known keys: $AUDIT_PROFILE_KEYS"
+    # Quotes are punctuation. Stripping them one end at a time accepted a value
+    # that was never quoted properly: SSH_HOST="10.9.8.7"  # prod came through
+    # as the host 10.9.8.7"  # prod and the run went on to connect to it.
+    # Single quotes are handled too: this file was a shell script until now, so
+    # they are a shape people already have, and left inside the value they made
+    # the one declared host unreachable with a message contradicting the file.
+    # An unquoted value may not carry a comment either: sourcing dropped it, and
+    # keeping it would put it inside a hostname or a directory name.
+    case "$value" in
+      '"'*'"') value="${value#\"}"; value="${value%\"}" ;;
+      "'"*"'") value="${value#\'}"; value="${value%\'}" ;;
+      '"'*|*'"'|"'"*|*"'") stop "the value of $key in $1 is not quoted properly:" \
+                      "  $line" \
+                      "A quote that opens must close, and nothing may follow it." ;;
+      *'#'*) stop "the value of $key in $1 carries what looks like a comment:" \
+                  "  $line" \
+                  "There are no trailing comments: put them on a line of their own," \
+                  "starting with #, or quote the value if the # is really part of it." ;;
+    esac
+    # Sourcing expanded shell variables for free, and reading the file as data
+    # does not. A profile written back then would now write its bundles into a
+    # directory literally called "$HOME", quietly, and you would go looking for
+    # reports that are not where you left them. Refused rather than expanded:
+    # expanding is what made this file dangerous in the first place.
+    case "$value" in
+      *'$'*) stop "the value of $key in $1 holds a shell variable:" \
+                  "  $line" \
+                  "The profile is read as data, so nothing in it is expanded." \
+                  "Write the path in full, or start it with ~/ for your home directory:" \
+                  "" \
+                  "  $key=\"~/sync/audit\"" ;;
+    esac
+    # The tilde is the shortcut people expect, and it expands without executing
+    # anything, so this one is kept.
+    case "$value" in
+      '~/'*) value="$HOME/${value#\~/}" ;;
+      '~') value="$HOME" ;;
+    esac
+    printf '%s=%s\n' "$key" "$value"
+  done < "$1"
+}
+
 # The profile is the only source of the target. Reading it here, once, is what
 # keeps the collector from ever running against a host nobody declared.
 if [ ! -f "$PROFILE_PATH" ]; then
   stop "no audit profile found at $PROFILE_PATH" \
        "Copy profile.example.conf there, or point AUDIT_PROFILE at your own file," \
-       "and fill in SSH_HOST, SSH_USER and ALLOWED_DOMAINS before running again."
+       "and fill in SSH_HOST, SSH_USER and WEB_TARGETS before running again."
 fi
-# shellcheck disable=SC1090
-. "$PROFILE_PATH"
 
-SSH_HOST="${SSH_HOST:-}"
+SSH_HOST=''; SSH_PORT=''; SSH_USER=''; WEB_TARGETS=''; OUTPUT_DIR=''
+# read_profile calls stop on a bad line, and stop exits: run in a pipeline it
+# would exit a subshell and the run would carry on with an empty profile. So it
+# runs first, on its own, and only its output is read here.
+PROFILE_LINES="$(read_profile "$PROFILE_PATH")" || exit $?
+while IFS='=' read -r k v; do
+  case "$k" in
+    SSH_HOST) SSH_HOST="$v" ;;
+    SSH_PORT) SSH_PORT="$v" ;;
+    SSH_USER) SSH_USER="$v" ;;
+    WEB_TARGETS) WEB_TARGETS="$v" ;;
+    OUTPUT_DIR) OUTPUT_DIR="$v" ;;
+  esac
+done <<EOF
+$PROFILE_LINES
+EOF
+
 SSH_PORT="${SSH_PORT:-22}"
-SSH_USER="${SSH_USER:-}"
-ALLOWED_DOMAINS="${ALLOWED_DOMAINS:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-./audit-output}"
 
-# An empty domain list means the profile was copied and never filled in. Better
-# to stop here than to audit whatever happens to be in the other fields.
-if [ -z "$(printf '%s' "$ALLOWED_DOMAINS" | tr -d '[:space:]')" ]; then
-  stop "ALLOWED_DOMAINS is empty in $PROFILE_PATH" \
-       "List the domains you own, space separated, before running an audit."
-fi
+# SSH_HOST is what this skill actually needs, and its absence is the sign of a
+# profile nobody filled in. The old check demanded ALLOWED_DOMAINS, a value this
+# skill never used for anything: it was standing in as proof the form had been
+# completed, and it was the wrong field to ask for.
 if [ -z "$SSH_HOST" ] || [ -z "$SSH_USER" ]; then
   stop "SSH_HOST or SSH_USER is missing in $PROFILE_PATH" \
        "Both are required: there is no default host."
 fi
-if profile_is_example "$SSH_HOST" "$ALLOWED_DOMAINS"; then
+if profile_is_example "$SSH_HOST" "$WEB_TARGETS"; then
   stop "the profile was never filled in: $PROFILE_PATH still holds example values" \
        "203.0.113.x, example.com, example.org and example.net are reserved names" \
        "from the documentation: no machine of yours answers there." \
@@ -122,7 +229,7 @@ if [ "${1:-}" = "--check-profile" ]; then
   printf 'ssh user:        %s\n' "$SSH_USER"
   printf 'output dir:      %s\n' "$OUTPUT_DIR"
   printf 'bundle would be: %s\n' "$(bundle_path)"
-  printf 'allowed domains: %s\n' "$ALLOWED_DOMAINS"
+  printf 'web targets:     %s\n' "$WEB_TARGETS"
   printf 'Nothing was connected to: this is a profile check only.\n'
   exit 0
 fi

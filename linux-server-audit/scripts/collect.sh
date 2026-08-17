@@ -392,8 +392,16 @@ excluded_by_contract() {
 # It streams (fflush on every line) rather than buffering the bundle: a run cut
 # off halfway must still leave behind everything it had collected.
 # ponytail: one awk in the pipe, no counters to keep in sync anywhere else.
+#
+# It also owns the completion marker. The body runs inside this pipe, so a fatal
+# error in it (an unbound variable under set -u) kills the body alone, and a
+# marker printed after the pipe would still appear: the wrapper uses that marker
+# as its one proof that the collection ran to the end, so a half bundle would be
+# renamed to a complete one and analysed, with a confident coverage line on top.
+# The body's last line is a sentinel, and only that sentinel earns the marker.
 coverage_tee() {
-  awk -v excluded="${AUDIT_EXCLUDED:-0}" '
+  awk -v excluded="${AUDIT_EXCLUDED:-0}" -v exclusions="$(excluded_by_contract)" '
+    /^##### BODY COMPLETE$/ { complete = 1; next }
     { print; fflush() }
     /^##### SECTION: / {
       if (section != "" && gap > 0)
@@ -413,6 +421,12 @@ coverage_tee() {
       printf "Coverage: %d verified, %d not verified, %d excluded by contract.\n", \
         verified, missing, excluded
       if (gaps != "") printf "Sections with gaps: %s.\n", gaps
+      printf "\nNot attempted at all, by contract. These are categories of action,\n"
+      printf "not commands, so they are not part of the two counts above:\n%s\n", exclusions
+      if (complete)
+        printf "\n\n##### END OF COLLECTION\n"
+      else
+        printf "\n\n##### COLLECTION CUT SHORT: the collector stopped before its last line.\nWhat is above is a fragment. Do not read it as an audit: run it again.\n"
     }'
 }
 
@@ -492,7 +506,11 @@ run_if() {   # <tool> <command> [lines] [seconds]
   if command -v "$tool" >/dev/null 2>&1; then
     run "$@"
   else
-    printf '\n$ %s\n' "$1"
+    # Announced as a title and not as a command line, because a check that does
+    # not apply is not a check that was made: counted among the verified ones it
+    # would inflate the number the report opens with, which is the first number
+    # the customer reads.
+    title "$1"
     printf 'NOT APPLICABLE: %s is not installed on this machine\n' "$tool"
   fi
 }
@@ -611,7 +629,11 @@ run 'cat /var/run/reboot-required.pkgs 2>/dev/null' 12
 # every report on whichever platform you happen to run.
 run_if apt 'set -o pipefail; apt list --upgradable 2>/dev/null | tail -n +2' 40 120
 run_if apt 'set -o pipefail; apt list --upgradable 2>/dev/null | grep -ci security || [ $? = 1 ]' 3 120
-run_if dnf 'dnf -q check-update --security 2>/dev/null' 20 120
+# dnf exits 100 exactly when there ARE updates, which is a full success and the
+# most interesting answer this command can give. Left unhandled, the section
+# that just listed pending security updates gets stamped "the command also
+# reported an error", which teaches the reader to skim past the notes.
+run_if dnf 'dnf -q check-update --security 2>/dev/null || [ $? = 100 ]' 20 120
 run 'cat /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null' 10
 run 'systemctl is-enabled unattended-upgrades 2>/dev/null; systemctl is-active unattended-upgrades 2>/dev/null' 4
 # Through run_summary, not by hand: the summariser is a shell function, and run
@@ -619,8 +641,18 @@ run 'systemctl is-enabled unattended-upgrades 2>/dev/null; systemctl is-active u
 # absent zgrep or a missing package log printed nothing and was read as a check
 # that had been made.
 title 'last upgrades installed (package log, in date order)'
-run_summary latest_upgrades 'set -o pipefail; zgrep -h " upgrade " /var/log/dpkg.log* 2>/dev/null' \
-  'no package upgrade recorded in the log of this machine' 5
+# Guarded on the log rather than on the tool: zgrep exists everywhere, the dpkg
+# log does not, and on the RHEL family this was a gap in every report forever.
+if ls /var/log/dpkg.log* >/dev/null 2>&1; then
+  # grep exits 1 when it matched nothing, which is the case the phrase below was
+  # written for: without the guard the phrase can never appear and a freshly
+  # installed machine shows a gap that is not one.
+  run_summary latest_upgrades \
+    'set -o pipefail; zgrep -h " upgrade " /var/log/dpkg.log* 2>/dev/null || [ $? = 1 ]' \
+    'no package upgrade recorded in the log of this machine' 5
+else
+  printf 'NOT APPLICABLE: this machine keeps no dpkg package log\n'
+fi
 
 sec "ACCOUNTS AND PRIVILEGES"
 # Who can become administrator, and in how many different ways.
@@ -826,10 +858,7 @@ run 'ip route' 10
 run_filtered mask_ip 'sudo -n ss -tn state established 2>/dev/null' 22
 run 'grep -v "^#" /etc/resolv.conf 2>/dev/null' 10
 
+# The last line of the body, and the only thing that earns the completion
+# marker. It never reaches the bundle: the counter swallows it.
+printf '\n##### BODY COMPLETE\n'
 } | coverage_tee
-
-printf '\nNot attempted at all, by contract. These are categories of action, not\n'
-printf 'commands, so they are not part of the two counts above:\n'
-excluded_by_contract
-
-printf '\n\n##### END OF COLLECTION\n'
