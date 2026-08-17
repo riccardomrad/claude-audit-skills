@@ -53,10 +53,16 @@ normalize_host() {
   printf '%s' "$h" | tr 'A-Z' 'a-z'
 }
 
-# True only for the domains declared in the profile and their subdomains. The
-# incoming host must already be normalised: if it holds characters that cannot
-# appear in a hostname it is refused anyway, as a safety net against odd forms.
-host_allowed() {   # <normalised host> <space separated domain list>
+# True only for the hosts declared in the profile. The incoming host must already
+# be normalised: if it holds characters that cannot appear in a hostname it is
+# refused anyway, as a safety net against odd forms.
+# Exact match only. The previous version accepted every subdomain of a declared
+# domain, so declaring radlab.it silently allowed anything.radlab.it, a
+# subdomain pointing at somebody else's service included: this skill promises it
+# audits only declared hosts, and a wildcard is not a declaration. It also means
+# a look-alike somebody else registered, ending in the name of yours, no longer
+# slips through a suffix comparison.
+host_allowed() {   # <normalised host> <space separated exact host list>
   case "$1" in
     ''|.*|*..*|*[!a-z0-9.-]*) return 1 ;;
   esac
@@ -64,9 +70,7 @@ host_allowed() {   # <normalised host> <space separated domain list>
   for d in $2; do
     d="$(printf '%s' "$d" | tr 'A-Z' 'a-z')"
     [ -n "$d" ] || continue
-    case "$1" in
-      "$d"|*."$d") return 0 ;;
-    esac
+    [ "$1" = "$d" ] && return 0
   done
   return 1
 }
@@ -154,6 +158,28 @@ follow_chain() {   # <fetcher> <starting url> <domain list> [max hops]
     fi
     url="$next"
   done
+}
+
+# Says, once and in the same words everywhere, that a section could not be
+# checked because the redirect chain walked out of the declared hosts. Returns
+# non zero so the caller skips its section instead of answering about a page it
+# never fetched.
+#
+# The apex redirecting to www is the most ordinary topology there is, and hosts
+# are matched exactly now, so a profile holding only the apex stops the chain at
+# the first hop. The redirect itself answered, so without this the collector
+# would keep the 301's headers and go on: the security headers would come back
+# ABSENT, every probed path would answer 301 and be read as "not there", and an
+# exposed environment file on www would be written down as absent, in a document
+# that goes to a customer. That is the worst thing this tool can do.
+page_unreachable_note() {   # <left scope flag> <address the chain stopped at>
+  [ "${1:-0}" -eq 1 ] || return 0
+  printf 'NOT VERIFIED: the redirect chain leaves the hosts you declared, so the\n'
+  printf 'page this section is about was never fetched.\n'
+  printf 'Declare %s in WEB_TARGETS and run the audit again.\n' "$2"
+  printf 'Nothing below was checked against the real page: an answer here would be\n'
+  printf 'a statement about a page nobody read.\n'
+  return 1
 }
 
 # Pause between one request and the next: an audit must not look like a scan.
@@ -447,24 +473,140 @@ profile_is_example() {   # <value ...>
 # The profile is the only source of the allowed domains. Reading it here, once,
 # is what keeps the collector from ever requesting anything from a host nobody
 # declared.
+# The profile is a form, and a form is data.
+#
+# READ THIS BEFORE EDITING: this function is a copy of the one in
+# linux-server-audit/scripts/run-audit.sh, and the two must stay identical. They
+# cannot share a file: the server collector is piped into ssh on standard input,
+# so it has nothing to source from. A test compares the two bodies and fails if
+# they drift, because "fixed in one and forgotten in the other" is exactly the
+# bug that made this rewrite necessary.
+#
+# It used to be sourced, which made every line in it a command: a profile copied
+# from somewhere else, or edited by somebody who did not write it, ran with your
+# account and your keys, and nothing in the file warned you.
+AUDIT_PROFILE_KEYS='SSH_HOST SSH_PORT SSH_USER WEB_TARGETS OUTPUT_DIR'
+
+read_profile() {   # read_profile <path>
+  local line key value known k
+  while IFS= read -r line || [ -n "$line" ]; do
+    # Trimmed at both ends before anything else. This covers three shapes that
+    # sourcing accepted and parsing would otherwise refuse on a file somebody
+    # just edited: an indented key, a line holding only spaces, and the carriage
+    # return a profile saved on Windows carries. Left in place, that carriage
+    # return rides along inside the hostname and inside every target, and every
+    # comparison downstream fails for a reason nothing on screen explains.
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    case "$line" in
+      ''|'#'*) continue ;;
+    esac
+    case "$line" in
+      *=*) ;;
+      *) stop "this line in $1 is not a KEY=value line:" \
+              "  $line" \
+              "The profile is a form, not a script: only KEY=\"value\" lines are read," \
+              "and nothing in it is ever executed." ;;
+    esac
+    key="${line%%=*}"
+    value="${line#*=}"
+    # The old key gets its own message: it is the one change in this release
+    # that breaks a file people already have, so the message has to be enough
+    # to fix it without opening any documentation.
+    if [ "$key" = "ALLOWED_DOMAINS" ]; then
+      stop "This profile uses ALLOWED_DOMAINS, which no longer exists." \
+           "Replace it with WEB_TARGETS and write every host in full, separated by spaces:" \
+           "" \
+           "  WEB_TARGETS=\"radlab.it www.radlab.it quarantotto.menulampo.it\"" \
+           "" \
+           "A bare domain no longer covers its subdomains: every host you want audited" \
+           "must be written out. Nothing was collected."
+    fi
+    case "$key" in
+      *[!A-Z_]*) stop "this line in $1 has a key that is not a plain name:" "  $line" ;;
+    esac
+    known=0
+    for k in $AUDIT_PROFILE_KEYS; do [ "$key" = "$k" ] && known=1; done
+    [ "$known" -eq 1 ] || stop "unknown key in $1:" \
+      "  $line" \
+      "Known keys: $AUDIT_PROFILE_KEYS"
+    # Quotes are punctuation. Stripping them one end at a time accepted a value
+    # that was never quoted properly: SSH_HOST="10.9.8.7"  # prod came through
+    # as the host 10.9.8.7"  # prod and the run went on to connect to it.
+    # Single quotes are handled too: this file was a shell script until now, so
+    # they are a shape people already have, and left inside the value they made
+    # the one declared host unreachable with a message contradicting the file.
+    # An unquoted value may not carry a comment either: sourcing dropped it, and
+    # keeping it would put it inside a hostname or a directory name.
+    case "$value" in
+      '"'*'"') value="${value#\"}"; value="${value%\"}" ;;
+      "'"*"'") value="${value#\'}"; value="${value%\'}" ;;
+      '"'*|*'"'|"'"*|*"'") stop "the value of $key in $1 is not quoted properly:" \
+                      "  $line" \
+                      "A quote that opens must close, and nothing may follow it." ;;
+      *'#'*) stop "the value of $key in $1 carries what looks like a comment:" \
+                  "  $line" \
+                  "There are no trailing comments: put them on a line of their own," \
+                  "starting with #, or quote the value if the # is really part of it." ;;
+    esac
+    # Sourcing expanded shell variables for free, and reading the file as data
+    # does not. A profile written back then would now write its bundles into a
+    # directory literally called "$HOME", quietly, and you would go looking for
+    # reports that are not where you left them. Refused rather than expanded:
+    # expanding is what made this file dangerous in the first place.
+    case "$value" in
+      *'$'*) stop "the value of $key in $1 holds a shell variable:" \
+                  "  $line" \
+                  "The profile is read as data, so nothing in it is expanded." \
+                  "Write the path in full, or start it with ~/ for your home directory:" \
+                  "" \
+                  "  $key=\"~/sync/audit\"" ;;
+    esac
+    # The tilde is the shortcut people expect, and it expands without executing
+    # anything, so this one is kept.
+    case "$value" in
+      '~/'*) value="$HOME/${value#\~/}" ;;
+      '~') value="$HOME" ;;
+    esac
+    printf '%s=%s\n' "$key" "$value"
+  done < "$1"
+}
+
 if [ ! -f "$PROFILE_PATH" ]; then
   stop "no audit profile found at $PROFILE_PATH" \
        "Copy profile.example.conf there, or point AUDIT_PROFILE at your own file," \
-       "and list your domains in ALLOWED_DOMAINS before running again."
+       "and list the hosts to audit in WEB_TARGETS before running again."
 fi
-# shellcheck disable=SC1090
-. "$PROFILE_PATH"
 
-ALLOWED_DOMAINS="${ALLOWED_DOMAINS:-}"
+# SSH_HOST is the origin address, and the secret hunt uses it to spot a page
+# leaking the machine behind the proxy. Parsed and not assigned, that check
+# receives an empty pattern, skips itself, and the bundle reports no secret
+# found: the promise in README and in the example profile would be false.
+SSH_HOST=''; WEB_TARGETS=''; OUTPUT_DIR=''
+# read_profile calls stop on a bad line, and stop exits: run in a pipeline it
+# would exit a subshell and the run would carry on with an empty profile. So it
+# runs first, on its own, and only its output is read here.
+PROFILE_LINES="$(read_profile "$PROFILE_PATH")" || exit $?
+while IFS='=' read -r k v; do
+  case "$k" in
+    SSH_HOST) SSH_HOST="$v" ;;
+    WEB_TARGETS) WEB_TARGETS="$v" ;;
+    OUTPUT_DIR) OUTPUT_DIR="$v" ;;
+  esac
+done <<EOF
+$PROFILE_LINES
+EOF
+
 OUTPUT_DIR="${OUTPUT_DIR:-./audit-output}"
 
-# An empty domain list means the profile was copied and never filled in. Better
+# An empty target list means the profile was copied and never filled in. Better
 # to stop here than to send requests to whatever was typed on the command line.
-if [ -z "$(printf '%s' "$ALLOWED_DOMAINS" | tr -d '[:space:]')" ]; then
-  stop "ALLOWED_DOMAINS is empty in $PROFILE_PATH" \
-       "List the domains you own, space separated, before auditing anything."
+if [ -z "$(printf '%s' "$WEB_TARGETS" | tr -d '[:space:]')" ]; then
+  stop "WEB_TARGETS is empty in $PROFILE_PATH" \
+       "List the hosts to audit, written in full and separated by spaces," \
+       "before auditing anything."
 fi
-if profile_is_example "$ALLOWED_DOMAINS"; then
+if profile_is_example "$WEB_TARGETS"; then
   stop "the profile was never filled in: $PROFILE_PATH still holds example values" \
        "example.com, example.org, example.net and 203.0.113.x are reserved names" \
        "from the documentation: none of them is yours." \
@@ -498,14 +640,21 @@ for extra in "$@"; do
 done
 
 host="$(normalize_host "$raw")"
-if ! host_allowed "$host" "$ALLOWED_DOMAINS"; then
+if ! host_allowed "$host" "$WEB_TARGETS"; then
   echo "REJECTED: $raw (read as host: ${host:-empty}) is out of scope." >&2
-  echo "This tool only works on the domains declared in ALLOWED_DOMAINS." >&2
+  echo "This tool only works on the hosts declared in WEB_TARGETS, each written in full." >&2
   exit 2
 fi
 
 if [ "$mode" = check ]; then
-  printf 'IN SCOPE: %s (matched against: %s)\n' "$host" "$ALLOWED_DOMAINS"
+  printf 'IN SCOPE: %s (matched against: %s)\n' "$host" "$WEB_TARGETS"
+  # Shown because it is used: a page leaking this address is a finding, and if
+  # the profile does not carry it the check quietly finds nothing.
+  if [ -n "$SSH_HOST" ]; then
+    printf 'origin address watched for in the pages: %s\n' "$SSH_HOST"
+  else
+    printf 'no origin address in the profile: a page leaking it will not be flagged\n'
+  fi
   printf 'Nothing was requested: this is a target check only.\n'
   exit 0
 fi
@@ -586,7 +735,7 @@ done
 sec "FROM CLEARTEXT TO ENCRYPTED"
 # A site still answering in cleartext, or not redirecting, is a site where
 # somebody on the same network can read and change the pages.
-follow_chain curl_headers "http://$host/" "$ALLOWED_DOMAINS" > "$tmp/chain-http.txt"
+follow_chain curl_headers "http://$host/" "$WEB_TARGETS" > "$tmp/chain-http.txt"
 verdict_or_not_verified "$FOLLOW_RC" "$(cat "$tmp/chain-http.txt" 2>/dev/null)" \
   'the cleartext version gave no answer at all, so the move to encrypted could not be checked'
 printf '[final destination reached] %s\n' "$FOLLOW_URL"
@@ -596,14 +745,22 @@ sec "RESPONSE HEADERS (HTTPS)"
 # The chain walked here is the one the visitor walks, and the answer at the end
 # of it is the page they get: headers and body are kept from that last hop
 # instead of asking for the same page a second time.
-follow_chain curl_headers "https://$host/" "$ALLOWED_DOMAINS" > "$tmp/chain-https.txt"
+follow_chain curl_headers "https://$host/" "$WEB_TARGETS" > "$tmp/chain-https.txt"
 cat "$tmp/chain-https.txt"
 home_url="$FOLLOW_URL"
 site_base="$(site_base_from "$home_url" "$host")"
 printf '[every later request starts from] %s\n' "$site_base"
 : > "$tmp/headers.txt"
 : > "$tmp/home.html"
-if [ "$FOLLOW_RC" -eq 0 ]; then
+# HOME_PAGE_REACHED is what every later section keys off. A chain that walked
+# out of the declared hosts answered with a redirect, not with the page: keeping
+# those headers would make each following section describe a 301 as if it were
+# the site.
+HOME_PAGE_REACHED=0
+if [ "$FOLLOW_LEFT_SCOPE" -eq 1 ]; then
+  page_unreachable_note 1 "$(printf '%s' "$FOLLOW_URL")" || :
+elif [ "$FOLLOW_RC" -eq 0 ]; then
+  HOME_PAGE_REACHED=1
   printf '%s\n' "$FOLLOW_HEADERS" > "$tmp/headers.txt"
   cp "$tmp/chain-body.bin" "$tmp/home.html" 2>/dev/null || : > "$tmp/home.html"
 fi
@@ -644,7 +801,29 @@ verdict_tls "$tls_rc" "$tls_out" | head -20
 echo
 pause
 
+# Everything from here on asks the site about its own pages, and all of it is
+# meaningless when the chain never reached the page. The sections above (names,
+# the move to encrypted, the certificate) stand on their own and are kept.
+#
+# Stopping rather than marking each section: with the page unreachable there is
+# no answer worth having, and the one useful thing to say is which host to
+# declare. Carrying on would fill the rest of the bundle with 301s read as
+# "not there", which is the reading that puts an exposed environment file into a
+# customer report as absent.
+if [ "$FOLLOW_LEFT_SCOPE" -eq 1 ]; then
+  sec "COLLECTION STOPPED BEFORE THE PAGE CHECKS"
+  page_unreachable_note 1 "$FOLLOW_URL" || :
+  printf '\nChecked before stopping: names and addresses, the move from cleartext to\n'
+  printf 'encrypted, and the certificate. Those do not depend on the page.\n'
+  printf '\nNot checked: response headers, cookies, methods, cross-origin sharing,\n'
+  printf 'paths that should not exist, directory listings, secrets inside pages,\n'
+  printf 'redirect parameters, and whether the panel is protected.\n'
+  printf '\n\n##### END OF COLLECTION\n'
+  exit 0
+fi
+
 sec "HTTP METHODS ACCEPTED"
+
 "${C[@]}" -I -X OPTIONS "$site_base/" > "$tmp/options.txt" 2>/dev/null
 options_rc=$?
 verdict_or_not_verified "$options_rc" \
@@ -653,6 +832,7 @@ verdict_or_not_verified "$options_rc" \
 pause
 
 sec "CROSS-ORIGIN SHARING"
+
 # The site is asked how it would treat a page hosted somewhere else. If it hands
 # that same origin back, it trusts any origin; with credentials on top, any site
 # can read the data of a logged in user.
@@ -662,6 +842,7 @@ verdict_cors "$cors_rc" "$cors_out" "$AUDIT_CORS_PROBE_ORIGIN"
 pause
 
 sec "PATHS THAT SHOULD NOT EXIST"
+
 # Read requests only. The content of sensitive files is NOT shown: the response
 # code and the size are enough to tell whether they are exposed.
 home_size="$(wc -c < "$tmp/home.html" 2>/dev/null || echo 0)"
@@ -706,6 +887,7 @@ show_if_text() {  # show_if_text <path> <label>
 show_if_text /robots.txt 'robots.txt'
 
 sec "OPEN DIRECTORY LISTINGS"
+
 for d in /assets/ /static/ /img/ /images/ /js/ /css/ /files/ /uploads/; do
   # The code is read from curl, not from the pipe: after a `| head` the exit
   # status is the one of head, which always succeeds, so a failed request would
@@ -727,6 +909,7 @@ for d in /assets/ /static/ /img/ /images/ /js/ /css/ /files/ /uploads/; do
 done
 
 sec "SECRETS AND INTERNAL ADDRESSES INSIDE PAGES"
+
 # The home page and the first scripts hosted ON THIS HOST are downloaded, and
 # searched for what should not be in a public page. Third party scripts are
 # listed only: fetching them would be a request to somebody else's site, which
@@ -754,6 +937,7 @@ else
 fi
 
 sec "REDIRECT PARAMETERS IN THE PAGES"
+
 # A parameter that decides where the user is sent is the brick session theft is
 # built from: it is reported so it can be looked at by hand.
 redirects="$(grep -Eiao '(\?|&)(url|next|redirect|redirect_uri|return|returnUrl|goto|dest|destination|continue|r)=[^"&<> ]{0,60}' \
@@ -765,6 +949,7 @@ else
 fi
 
 sec "IS THE PANEL PROTECTED"
+
 # For any exposed management interface the question is not whether the password
 # is strong, it is whether the login screen is reachable by anybody. A barrier
 # in front removes every automated attempt before it reaches the application.

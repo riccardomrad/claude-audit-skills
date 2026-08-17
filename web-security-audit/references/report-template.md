@@ -52,7 +52,8 @@ they said, and that is the only thing it may state.
 
 If it is empty, say so bounded: "No finding among the checks that were
 verified." An empty table with checks left unverified is not a quiet site, it is
-a partial audit, and the coverage line above says which one you are reading.
+a partial audit, and the list under "What could not be checked" above says which
+one you are reading.
 
 **How each row is written.** A finding is only worth as much as the reader's
 ability to act on it, so borrow the discipline of a vulnerability report

@@ -30,10 +30,16 @@ sending anything and without trying to get into anywhere.
 
 ## The four rules that do not bend
 
-1. **Your own property only.** The collector accepts a host only if it matches
-   the domain list in the audit profile, and refuses everything else. If you
-   need a new domain, add it to the profile after checking that it is yours or
-   that the customer authorised it in writing. Never work around that refusal
+1. **Your own property only.** The collector accepts a host only if it is listed
+   in `WEB_TARGETS` in the audit profile, matched exactly, and refuses
+   everything else. Every host is written out in full: `radlab.it` does not
+   cover `www.radlab.it`, and neither covers `shop.radlab.it`. That is
+   deliberate, because a wildcard over a domain also covers the subdomain
+   somebody pointed at a supplier's service, which is not yours to request.
+   Expect to declare the `www` form as well, and every host a redirect may lead
+   to, or the chain stops at the first hop. If you need a new host, add it to
+   the profile after checking that it is yours or that the customer authorised
+   it in writing. Never work around that refusal
    with another tool: it is the difference between an internal check and
    unauthorised access. Recon on out-of-scope hosts is treated as an attack, not
    as a formality (Li ch. 5).

@@ -45,7 +45,8 @@ cp profile.example.conf ~/.config/audit-skills/profile.conf
 $EDITOR ~/.config/audit-skills/profile.conf
 ```
 
-Keys: `ALLOWED_DOMAINS` (space separated, the domains you own), `OUTPUT_DIR`
+Keys: `WEB_TARGETS` (space separated, every host written in full, no implicit
+subdomains: `radlab.it` does not cover `www.radlab.it`), `OUTPUT_DIR`
 (default `./audit-output`), and optionally `SSH_HOST`, `SSH_PORT`, `SSH_USER`,
 which the companion server skill uses and which let this one flag your origin
 server's address if it shows up inside a page.

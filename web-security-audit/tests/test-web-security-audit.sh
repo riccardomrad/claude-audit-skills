@@ -89,7 +89,7 @@ trap 'rm -rf "$t"' EXIT
 # environment, so a test can never send a request anywhere.
 check_target() {   # check_target <profile path> <target> [extra path ...]
   local profile="$1"; shift
-  env -u ALLOWED_DOMAINS -u OUTPUT_DIR -u SSH_HOST \
+  env -u WEB_TARGETS -u OUTPUT_DIR -u SSH_HOST \
       AUDIT_PROFILE="$profile" bash "$COLLECT" --check-target "$@" 2>&1
 }
 check_target_rc() {   # check_target_rc <profile path> <target> [extra path ...]
@@ -102,8 +102,10 @@ check_target_rc() {   # check_target_rc <profile path> <target> [extra path ...]
 # collector refuses it. The pure filter functions below are handed their domain
 # list as an argument and keep using the reserved names, which is what those
 # names are for.
-printf 'ALLOWED_DOMAINS="mysite.test othersite.test"\nOUTPUT_DIR="%s/out"\n' "$t" > "$t/good.conf"
-printf 'ALLOWED_DOMAINS=""\nOUTPUT_DIR="%s/out"\n' "$t" > "$t/empty-domains.conf"
+# www.mysite.test is written out: a bare domain no longer carries its
+# subdomains, which is the whole point of the change.
+printf 'WEB_TARGETS="mysite.test www.mysite.test othersite.test"\nOUTPUT_DIR="%s/out"\n' "$t" > "$t/good.conf"
+printf 'WEB_TARGETS=""\nOUTPUT_DIR="%s/out"\n' "$t" > "$t/empty-targets.conf"
 
 echo
 echo '=== PROFILE: nothing runs against an undeclared target ==='
@@ -111,17 +113,20 @@ out="$(check_target "$t/does-not-exist.conf" mysite.test)"
 expect_nonzero 'missing profile: exit code is not zero' "$(check_target_rc "$t/does-not-exist.conf" mysite.test)"
 contains 'missing profile: the message names the profile' 'no audit profile found' "$out"
 
-out="$(check_target "$t/empty-domains.conf" mysite.test)"
-expect_nonzero 'empty domain list: exit code is not zero' "$(check_target_rc "$t/empty-domains.conf" mysite.test)"
-contains 'empty domain list: the message names ALLOWED_DOMAINS' 'ALLOWED_DOMAINS' "$out"
+out="$(check_target "$t/empty-targets.conf" mysite.test)"
+expect_nonzero 'empty target list: exit code is not zero' "$(check_target_rc "$t/empty-targets.conf" mysite.test)"
+contains 'empty target list: the message names WEB_TARGETS' 'WEB_TARGETS' "$out"
 
 out="$(check_target "$t/good.conf" www.mysite.test)"
-expect  'a configured domain is accepted'  0 "$(check_target_rc "$t/good.conf" www.mysite.test)"
+expect  'a declared host is accepted'  0 "$(check_target_rc "$t/good.conf" www.mysite.test)"
 contains 'the accepted target is echoed back' 'www.mysite.test' "$out"
 out="$(check_target "$t/good.conf" www.notmine.test)"
-expect  'a domain that is not configured is refused' 2 "$(check_target_rc "$t/good.conf" www.notmine.test)"
+expect  'a host that is not declared is refused' 2 "$(check_target_rc "$t/good.conf" www.notmine.test)"
 contains 'the refusal says the target is out of scope' 'out of scope' "$out"
-expect  'the second configured domain is accepted too' 0 "$(check_target_rc "$t/good.conf" othersite.test)"
+expect  'the second declared host is accepted too' 0 "$(check_target_rc "$t/good.conf" othersite.test)"
+# The subdomain that is NOT in the list, of a domain that is: refused now.
+expect  'an undeclared subdomain of a declared domain is refused' 2 \
+  "$(check_target_rc "$t/good.conf" shop.mysite.test)"
 file_has 'the default profile path is the shared one' 'config/audit-skills/profile.conf' "$COLLECT"
 
 echo
@@ -251,17 +256,17 @@ echo '=== PROFILE: the example file is a form, not a profile ==='
 # The example file says in writing that the skill refuses to run while it is a
 # stub. That sentence has to be true, or it is the worst kind of documentation:
 # the kind that stops people from checking.
-printf 'ALLOWED_DOMAINS="example.com example.org"\nOUTPUT_DIR="%s/out"\n' "$t" > "$t/still-example.conf"
+printf 'WEB_TARGETS="example.com example.org"\nOUTPUT_DIR="%s/out"\n' "$t" > "$t/still-example.conf"
 expect_nonzero 'a domain list still holding the reserved names does not run' \
   "$(check_target_rc "$t/still-example.conf" www.example.com)"
 contains 'and the message says the profile was never filled in' 'never filled in' \
   "$(check_target "$t/still-example.conf" www.example.com)"
-printf 'ALLOWED_DOMAINS="mysite.test example.org"\nOUTPUT_DIR="%s/out"\n' "$t" > "$t/half-example.conf"
+printf 'WEB_TARGETS="mysite.test example.org"\nOUTPUT_DIR="%s/out"\n' "$t" > "$t/half-example.conf"
 expect_nonzero 'one reserved domain left in the list is enough to stop' \
   "$(check_target_rc "$t/half-example.conf" www.mysite.test)"
-file_has 'the example profile ships an empty domain list' 'ALLOWED_DOMAINS=""' "$EXAMPLE"
+file_has 'the example profile ships an empty target list' 'WEB_TARGETS=""' "$EXAMPLE"
 file_has 'the example profile leaves the optional host empty' 'SSH_HOST=""' "$EXAMPLE"
-file_lacks 'and carries no value that looks already filled in' 'ALLOWED_DOMAINS="[a-z]' "$EXAMPLE"
+file_lacks 'and carries no value that looks already filled in' 'WEB_TARGETS="[a-z]' "$EXAMPLE"
 
 echo
 echo '=== SAVING A BUNDLE: the collection of an hour ago survives ==='
@@ -329,7 +334,7 @@ collect_out=''; collect_rc=''
 run_collect() {   # run_collect <log> <directory for temporary files> <args...>
   local log="$1" td="$2"; shift 2
   : > "$log"
-  collect_out="$(env -u ALLOWED_DOMAINS -u OUTPUT_DIR -u SSH_HOST \
+  collect_out="$(env -u WEB_TARGETS -u OUTPUT_DIR -u SSH_HOST \
       AUDIT_PROFILE="$t/good.conf" AUDIT_PAUSE=0 CURL_LOG="$log" \
       TMPDIR="$td" PATH="$t/bin:$PATH" bash "$COLLECT" "$@" 2>&1)"
   collect_rc=$?
@@ -373,9 +378,16 @@ fake_headers_offsite() {
     *) printf 'HTTP/1.1 200\r\n' ;;
   esac
 }
-fake_headers_loop() { printf 'HTTP/1.1 301\r\nlocation: https://a%s.mysite.test/\r\n' "$RANDOM"; }
+# The loop stays on a declared host and changes the path, so what stops the
+# chain is the hop limit and nothing else. It used to invent a new subdomain per
+# hop, which now leaves the declared list on the first hop and would have tested
+# the scope check a second time instead of the limit.
+fake_headers_loop() { printf 'HTTP/1.1 301\r\nlocation: https://mysite.test/a%s\r\n' "$RANDOM"; }
 fake_headers_fail() { return 7; }
-domains='mysite.test othersite.test'
+# www.mysite.test is written out: the chain walks through it, and a bare domain
+# no longer carries its subdomains. Declaring every host the chain may reach is
+# the point of the rule, not a chore it imposes.
+domains='mysite.test www.mysite.test othersite.test'
 
 expect 'a redirect to an absolute address is read' 'https://www.mysite.test/x' \
   "$(redirect_target 'HTTP/1.1 301
@@ -537,6 +549,115 @@ if [ "${n_raw:-0}" -le 1 ]; then
   ok=$((ok+1)); printf 'ok    family: only the chain starts from the raw target (%s use)\n' "$n_raw"
 else
   ko=$((ko+1)); printf 'KO    family: %s requests still start from the raw target instead of the resolved one\n' "$n_raw"
+fi
+
+echo
+echo '=== TARGETS: a bare domain does not cover its subdomains ==='
+# A wildcard is not a declaration. Declaring radlab.it used to allow anything
+# under it, including a subdomain pointing at somebody else's service, and
+# sending requests there is not ours to do.
+if host_allowed 'shop.radlab.it' 'radlab.it'; then
+  ko=$((ko+1)); printf 'KO    targets: an undeclared subdomain must be refused\n'
+else
+  ok=$((ok+1)); printf 'ok    targets: an undeclared subdomain is refused\n'
+fi
+if host_allowed 'radlab.it' 'radlab.it shop.radlab.it'; then
+  ok=$((ok+1)); printf 'ok    targets: a declared host is accepted\n'
+else
+  ko=$((ko+1)); printf 'KO    targets: a declared host must be accepted\n'
+fi
+if host_allowed 'shop.radlab.it' 'radlab.it shop.radlab.it'; then
+  ok=$((ok+1)); printf 'ok    targets: a host declared in full is accepted\n'
+else
+  ko=$((ko+1)); printf 'KO    targets: a host declared in full must be accepted\n'
+fi
+# The look-alike that a suffix match would have let through: a domain somebody
+# else registered ending in the name of yours.
+if host_allowed 'evilradlab.it' 'radlab.it'; then
+  ko=$((ko+1)); printf 'KO    targets: a look-alike domain must be refused\n'
+else
+  ok=$((ok+1)); printf 'ok    targets: a look-alike domain is refused\n'
+fi
+
+echo
+echo '=== SCOPE STOP: a chain that leaves the declared hosts answers nothing ==='
+# The apex redirecting to www is the most ordinary topology there is, and with
+# exact matching a profile holding only the apex now stops the chain at hop 1.
+# The 301 did answer, so without a guard the collector keeps the redirect's
+# headers and every later section reports about a page it never fetched: the
+# security headers come back ABSENT, and an exposed .env on www is recorded as
+# not there, in a document that goes to a customer.
+out="$(page_unreachable_note 1 'https://www.mysite.test/')"
+contains 'scope stop: the section is marked not verified' 'NOT VERIFIED' "$out"
+contains 'scope stop: the note names the host to declare' 'www.mysite.test' "$out"
+contains 'scope stop: the note says what to do about it' 'WEB_TARGETS' "$out"
+expect_nonzero 'scope stop: the caller is told to skip its section' \
+  "$(page_unreachable_note 1 'https://www.mysite.test/' >/dev/null 2>&1; printf '%s' "$?")"
+
+out="$(page_unreachable_note 0 'https://mysite.test/')"
+expect 'scope stop: a chain that stayed home prints nothing' '' "$out"
+expect 'scope stop: and lets the caller carry on' 0 \
+  "$(page_unreachable_note 0 'https://mysite.test/' >/dev/null 2>&1; printf '%s' "$?")"
+
+file_has 'scope stop: the home page is not kept when the chain left the scope' \
+  'FOLLOW_LEFT_SCOPE' "$COLLECT"
+
+echo
+echo '=== PROFILE: it is data, not a program, in this collector too ==='
+# The server skill reads the profile as data. This one still sourced it, so the
+# hole the change exists to close stayed open on the very file the two skills
+# are told to share, and no single profile satisfied both.
+marker="$t/web-profile-was-executed"
+rm -f "$marker"
+printf 'WEB_TARGETS="mysite.test"\ntouch %s\n' "$marker" > "$t/hostile.conf"
+out="$(AUDIT_PROFILE="$t/hostile.conf" bash "$COLLECT" --check-target mysite.test 2>&1)"; rc=$?
+expect_nonzero 'profile: a line that is not KEY=value is refused' "$rc"
+if [ -e "$marker" ]; then
+  ko=$((ko+1)); printf 'KO    profile: the command inside the profile was executed\n'
+else
+  ok=$((ok+1)); printf 'ok    profile: the command inside the profile was not executed\n'
+fi
+
+printf 'ALLOWED_DOMAINS="mysite.test"\n' > "$t/old.conf"
+out="$(AUDIT_PROFILE="$t/old.conf" bash "$COLLECT" --check-target mysite.test 2>&1)"; rc=$?
+expect_nonzero 'profile: the old key stops the run here too' "$rc"
+contains 'profile: the message says which key replaces it' \
+  'Replace it with WEB_TARGETS and write every host in full' "$out"
+
+# The one profile has to satisfy both skills, or the sentence promising it is
+# false and nobody can run the toolkit at all.
+# SSH_HOST is read by this collector too: it is the origin address, and the
+# secret hunt uses it to spot a page leaking the machine behind the proxy.
+# Parsed but never assigned, that check dies without a word and the bundle says
+# there was no secret to find. The harness runs with SSH_HOST unset in the
+# environment, so only reading it from the profile can make this pass.
+printf 'SSH_HOST="203.0.113.77"\nSSH_USER="auditor"\nWEB_TARGETS="mysite.test"\nOUTPUT_DIR="%s/out"\n' "$t" > "$t/origin.conf"
+out="$(AUDIT_PROFILE="$t/origin.conf" bash "$COLLECT" --check-target mysite.test 2>&1)"
+contains 'profile: the origin address is read from the profile' '203.0.113.77' "$out"
+
+printf 'SSH_HOST="10.9.8.7"\nSSH_USER="auditor"\nWEB_TARGETS="mysite.test"\nOUTPUT_DIR="%s/out"\n' "$t" > "$t/shared.conf"
+out="$(AUDIT_PROFILE="$t/shared.conf" bash "$COLLECT" --check-target mysite.test 2>&1)"
+expect 'profile: the shared profile is accepted by this skill too' 0 "$?"
+contains 'profile: the declared host is recognised' 'mysite.test' "$out"
+
+file_lacks 'profile: this collector no longer sources the profile' \
+  '^\. "\$PROFILE_PATH"' "$COLLECT"
+file_lacks 'the example profile no longer ships the old key' 'ALLOWED_DOMAINS' "$EXAMPLE"
+file_has 'the example profile ships the new one' 'WEB_TARGETS=""' "$EXAMPLE"
+file_lacks 'the targets reference no longer promises subdomain matching' \
+  'or a subdomain of one' "$TARGETS"
+
+# The two collectors cannot share a file: the server one is piped into ssh on
+# standard input, so it has nothing to source from. The copy is forced by that,
+# and a copy drifts. "Fixed in one and forgotten in the other" is the exact bug
+# that made this rewrite necessary, so the two bodies are compared here.
+server_reader="$(awk '/^read_profile\(\)/{on=1} on{print; if (/^}/) exit}' \
+  "$SKILL/../linux-server-audit/scripts/run-audit.sh" 2>/dev/null)"
+web_reader="$(awk '/^read_profile\(\)/{on=1} on{print; if (/^}/) exit}' "$COLLECT")"
+if [ -n "$server_reader" ] && [ "$server_reader" = "$web_reader" ]; then
+  ok=$((ok+1)); printf 'ok    the two copies of the profile reader are identical\n'
+else
+  ko=$((ko+1)); printf 'KO    the two copies of the profile reader have drifted apart\n'
 fi
 
 echo

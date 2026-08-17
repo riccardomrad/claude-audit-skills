@@ -2,15 +2,24 @@
 
 ## The allowed-target rule
 
-The collector accepts only hosts that match a domain in `ALLOWED_DOMAINS` in the
-audit profile, or a subdomain of one. It refuses everything else, and that is
-not a formality: a tool that poked around somebody else's site, even by accident
-and even only reading, is a legal problem, not a technical mistake. Recon
-against a host you have no permission for counts as an attack on it (Li ch. 5).
+The collector accepts only hosts listed in `WEB_TARGETS` in the audit profile,
+matched exactly. It refuses everything else, and that is not a formality: a tool
+that poked around somebody else's site, even by accident and even only reading,
+is a legal problem, not a technical mistake. Recon against a host you have no
+permission for counts as an attack on it (Li ch. 5).
 
-To check a new domain (a customer with a domain of their own), add it to
-`ALLOWED_DOMAINS` after verifying it is yours or that the customer authorised it
-in writing. Do not work around the refusal with another tool.
+**Every host is written out in full.** A bare domain covers itself and nothing
+else: `radlab.it` does not cover `www.radlab.it`, and neither covers
+`shop.radlab.it`. This costs a line per host and buys the thing the rule is for.
+A wildcard over a domain also covers the subdomain somebody pointed at a service
+that is not yours, a hosted shop or a status page run by a supplier, and the
+list is supposed to be the record of what you may touch. It also closes the
+look-alike: a domain a stranger registered ending in the name of yours no longer
+slips through.
+
+To check a new host (a customer with a domain of their own), add it to
+`WEB_TARGETS` after verifying it is yours or that the customer authorised it in
+writing. Do not work around the refusal with another tool.
 
 The name is normalised before the check (scheme, credentials, path, query,
 fragment, port, trailing dot, capitals) and only then compared with the list, so
@@ -47,7 +56,9 @@ what went live last week. Rebuild it every time, in this order:
      | tr ',' '\n' | grep -i name_value | sort -u | head -40
    ```
 
-   Run it once per domain in `ALLOWED_DOMAINS`. Every name you cannot explain is
+   Run it once per registered domain of yours, not once per host in
+   `WEB_TARGETS`: the point here is finding the names you did not know about.
+   Every name you cannot explain is
    worth looking at: this is how you find leftover test copies and subdomains
    pointed at services you stopped using.
 
