@@ -11,13 +11,38 @@ unexplained acronyms.
 Properties checked: <list of hosts, one per line>
 Collection: <bundle files used>
 Compared with: <previous audit, or "first audit">
-Every check was read only: nothing sent, no access attempted, nothing changed.
+Every check was read only: only GET, HEAD and OPTIONS requests, no payload, no
+login attempted, nothing changed. Those requests do reach the site, and they
+appear in its logs and in its counters, and they may warm its cache.
+
+Two things also leave for somebody else. The names of the hosts being audited
+are resolved through the public Cloudflare resolver, so those names, internal
+ones included, become known to a third party. And the certificate check opens a
+real TLS session with each host. Say this out loud when the customer's hostnames
+are the kind that should not travel.
+
+What could not be checked: <list, or "every check ran">
+
+<This collector does not count for you: the server one does, this one does not
+yet. So do not write a number here. Go through the bundle and take every NOT VERIFIED line,
+then list what it was: the host, the check, and the reason if the bundle gives one. A list you read off the page is a fact; a total you estimated
+is a number you made up, and this report goes to a customer.
+
+Never leave this line out, not even to write "every check ran": a report with
+nothing in this place is a report whose reader assumes everything was looked
+at.>
 
 ## In two lines
 
-<General state in human words. Example: "The customer applications are clean and
-protected. The automation panel sits behind a barrier and is fine. One thing has
-to be closed today: an old subdomain pointing at nothing.">
+<General state in human words, bounded by what was actually verified. Example:
+"No problem found among the 42 checks that could be verified on the three
+customer sites. The certificate of one host could not be read, so nothing is
+known about its expiry. One thing has to be closed today: an old subdomain
+pointing at nothing.">
+
+No clean bill of health: no adjective that declares a site as a whole safe,
+sound, healthy or free of problems. The audit knows which checks it ran and what
+they said, and that is the only thing it may state.
 
 ## Fix now
 
@@ -25,7 +50,9 @@ to be closed today: an old subdomain pointing at nothing.">
 |---|--------------|------|----------|--------------------------|---------------|
 | 1 | <host> | <description> | CRITICAL | <concretely: who gets in, what they see, who pays for it> | <step> |
 
-If it is empty, say so: "Nothing to fix right now."
+If it is empty, say so bounded: "No finding among the checks that were
+verified." An empty table with checks left unverified is not a quiet site, it is
+a partial audit, and the coverage line above says which one you are reading.
 
 **How each row is written.** A finding is only worth as much as the reader's
 ability to act on it, so borrow the discipline of a vulnerability report

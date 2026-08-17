@@ -721,6 +721,169 @@ for fn in run run_filtered check run_summary docker_check; do
 done
 
 echo
+echo '=== COVERAGE: the count reads the bundle, so it cannot contradict it ==='
+# Counting calls to emit was the first attempt and it was wrong: five other
+# places in this collector print NOT VERIFIED without going through emit
+# (docker_check, login_history, the failed login count, the MAC denial count,
+# the per account key read), so the number denied gaps the bundle was showing
+# on the same page. Counting the text the reader sees cannot drift from it.
+fake_bundle='##### SECTION: FIREWALL
+
+$ sudo -n nft list ruleset
+table inet filter { }
+
+$ sudo -n ufw status
+NOT VERIFIED: the command printed nothing and did not succeed
+
+
+##### SECTION: CONTAINERS
+
+$ sudo -n docker inspect
+NOT VERIFIED: the container engine did not answer (permission denied)
+
+$ sudo -n docker ps
+NOT VERIFIED: the container engine did not answer (permission denied)
+
+
+##### SECTION: SSH
+
+$ sshd -T
+port 4422
+'
+out="$(printf '%s\n' "$fake_bundle" | coverage_tee)"
+contains 'coverage: the three numbers are stated' \
+  'Coverage: 2 verified, 3 not verified, 6 excluded by contract.' "$out"
+contains 'coverage: a NOT VERIFIED printed outside emit is counted' \
+  'CONTAINERS (0/2)' "$out"
+contains 'coverage: a section that lost one check of two is scored' \
+  'FIREWALL (1/2)' "$out"
+lacks 'coverage: a section that lost nothing is not named' 'SSH (' "$out"
+contains 'coverage: the bundle text is passed through unchanged' \
+  'table inet filter { }' "$out"
+
+# One command can print several NOT VERIFIED lines (the per account key loop
+# does), and that is still one check that did not happen, not five.
+many='##### SECTION: ACCOUNTS
+
+$ read every authorized_keys
+root             NOT VERIFIED: could not be reached
+ricca            NOT VERIFIED: could not be reached
+deploy           NOT VERIFIED: could not be reached
+'
+out="$(printf '%s\n' "$many" | coverage_tee)"
+contains 'coverage: several failures under one command count as one gap' \
+  'Coverage: 0 verified, 1 not verified, 6 excluded by contract.' "$out"
+
+# A command that answered is verified even if its exit code was not zero:
+# "systemctl is-active" exits 3 to say "inactive", which is a real answer, and
+# "no reboot pending" is the healthy case. Counting those as gaps would report
+# a healthy server as a partial audit.
+answered='##### SECTION: PENDING UPDATES
+
+$ systemctl is-active unattended-upgrades
+inactive
+
+$ cat /var/run/reboot-required.pkgs
+no reboot pending
+'
+out="$(printf '%s\n' "$answered" | coverage_tee)"
+contains 'coverage: a command that answered is verified whatever its exit code' \
+  'Coverage: 2 verified, 0 not verified, 6 excluded by contract.' "$out"
+lacks 'coverage: with nothing missing the gaps line does not appear' 'Sections with gaps' "$out"
+
+expect 'coverage: the excluded list is as long as the number it states' \
+  "${AUDIT_EXCLUDED:-unset}" "$(excluded_by_contract </dev/null 2>/dev/null | grep -c .)"
+# The exclusions belong to this collector: a read-only server audit is not in a
+# position to fuzz anything or fire a webhook, and listing what it was never
+# near reads as coverage it chose not to take.
+file_lacks 'coverage: the exclusions are not the ones of the web collector' \
+  'broad fuzzing and wide port scanning' "$COLLECT"
+
+# A cut hidden inside the command hides the exit code with it: "dnf | head" on a
+# machine with no dnf leaves head exiting zero and no output, which this count
+# would read as a check that was made.
+file_lacks 'coverage: no list cut is hidden inside a command in the body' \
+  "^(run|run_filtered|check|run_summary).*\| *head " "$COLLECT"
+file_has 'coverage: the pipeline that keeps its head guards its exit code' \
+  "set -o pipefail; apt list --upgradable" "$COLLECT"
+file_lacks 'coverage: the second apt pipeline guards its exit code too' \
+  "^run 'apt list --upgradable 2>/dev/null \| grep" "$COLLECT"
+
+# A heading is not a command. Written with the "$ " prefix it becomes a second
+# command line for a check that ran once, and every one of them inflates the
+# verified count on every single run.
+file_lacks 'coverage: no heading is written as a command line' \
+  "^printf '.n[$] [a-z].*[^n]'$" "$COLLECT"
+titles='##### SECTION: ACCOUNTS
+
+-- summary of sudo rules (contents not reported)
+
+$ cat /etc/sudoers
+NOT VERIFIED: the command printed nothing and did not succeed
+'
+out="$(printf '%s\n' "$titles" | coverage_tee)"
+contains 'coverage: a title line is not counted as a command' \
+  'Coverage: 0 verified, 1 not verified, 6 excluded by contract.' "$out"
+contains 'coverage: the section score counts the check once' 'ACCOUNTS (0/1)' "$out"
+
+# A tool that is not installed is not a check that failed. Ubuntu has no dnf and
+# RHEL has no apt: calling either one a gap puts a permanent hole in every
+# report on the majority platform, and a permanent hole is one nobody reads.
+absent='##### SECTION: PENDING UPDATES
+
+$ dnf -q check-update --security
+NOT APPLICABLE: dnf is not installed on this machine
+
+$ apt list --upgradable
+libssl3/jammy-updates 3.0.2-0ubuntu1.15 amd64 [upgradable from: 3.0.2-0ubuntu1.12]
+'
+out="$(printf '%s\n' "$absent" | coverage_tee)"
+contains 'coverage: an absent tool is answered, not counted as a gap' \
+  'Coverage: 2 verified, 0 not verified, 6 excluded by contract.' "$out"
+lacks 'coverage: an absent tool does not open a permanent gap' 'Sections with gaps' "$out"
+
+if command -v sh >/dev/null 2>&1; then
+  out="$(run_if sh 'echo reached' 5 5 2>&1)"
+  contains 'run_if: a tool that is there runs its command' 'reached' "$out"
+fi
+# The marker has to differ from the text of the command, because the heading
+# prints the command itself: looking for the command text would find the
+# heading and call it an execution.
+out="$(run_if definitely-not-a-real-tool 'printf "X%s\n" EXECUTED' 5 5 2>&1)"
+contains 'run_if: a tool that is missing says so plainly' 'NOT APPLICABLE' "$out"
+lacks 'run_if: a tool that is missing does not run its command' 'XEXECUTED' "$out"
+lacks 'run_if: a missing tool is not reported as a failed check' 'NOT VERIFIED' "$out"
+
+# These two used to run outside the run/check family, so an absent zgrep, a
+# missing package log or an unreadable fstab printed nothing and was counted as
+# a check that was made. They cannot go through run: they call shell functions,
+# and run executes its command in a fresh bash that never saw them.
+file_has 'coverage: the package log goes through the honest path' \
+  'run_summary latest_upgrades' "$COLLECT"
+file_has 'coverage: the fstab summary goes through the honest path' \
+  'run_summary summarize_fstab' "$COLLECT"
+file_lacks 'coverage: the fstab summary no longer cuts silently' \
+  'summarize_fstab < /etc/fstab' "$COLLECT"
+
+file_has 'the skill explains where the coverage line is' 'COVERAGE' "$SKILL_MD"
+
+echo
+echo '=== FAMILY: no report template may offer a clean bill of health ==='
+for forbidden in 'in good shape' 'Nothing to fix right now' 'nothing sent' \
+                 'is clean' 'is protected' 'all clear'; do
+  if grep -qiF "$forbidden" "$TEMPLATE"; then
+    ko=$((ko+1)); printf 'KO    template must not suggest [%s]\n' "$forbidden"
+  else
+    ok=$((ok+1)); printf 'ok    template does not suggest [%s]\n' "$forbidden"
+  fi
+done
+file_has 'the template opens with the coverage line' \
+  'Coverage: .* verified, .* not verified' "$TEMPLATE"
+expect_lt 'the coverage line comes before the two line summary' \
+  "$(grep -n 'Coverage: .* verified' "$TEMPLATE" | head -1 | cut -d: -f1)" \
+  "$(grep -n '^## In two lines' "$TEMPLATE" | head -1 | cut -d: -f1)"
+
+echo
 printf 'TESTS: %d passed, %d failed (%d total)\n' "$ok" "$ko" "$((ok+ko))"
 [ "$ko" -eq 0 ] || exit 1
 exit 0

@@ -29,6 +29,12 @@
 set -u
 export LC_ALL=C
 
+# What this collector refuses to do, listed by hand and counted by hand. It
+# cannot count what it never runs, so a calculated number here would be a
+# fiction. Six lines: if one day we stop excluding something, the line goes
+# away and the change shows up in the diff.
+AUDIT_EXCLUDED=6
+
 # =============================================================================
 # FUNCTIONS
 # Kept separate from the body so they can be tested without a server:
@@ -352,6 +358,64 @@ latest_upgrades() { grep " upgrade " | sort | tail -5; }
 
 sec() { printf '\n\n##### SECTION: %s\n' "$1"; }
 
+# A heading for the check that follows. It deliberately does NOT start with the
+# "$ " prefix: that prefix means "this line is a command", and the coverage
+# count reads it as one. Written with it, a heading became a second command for
+# a check that ran once, and inflated the verified count on every run.
+title() { printf '\n-- %s\n' "$1"; }
+
+excluded_by_contract() {
+  printf '%s\n' \
+    'changing any file, service, rule or account: nothing is written, ever' \
+    'restarting, stopping or starting anything, and installing or updating anything' \
+    'reading the contents of keys, certificates and environment files (name, owner and mode only)' \
+    'login attempts, password changes and anything that authenticates as somebody' \
+    'restore drills, because restoring writes files' \
+    'reaching out to any machine other than this one'
+}
+
+# How much of this audit actually happened, counted from the bundle itself as it
+# goes past.
+#
+# The first attempt counted calls to emit, and it was wrong: five other places
+# in here print NOT VERIFIED without going through emit (docker_check,
+# login_history, the failed login count, the MAC denial count, the per account
+# key read), so the number denied gaps the bundle was showing on the same page.
+# Counting the text the reader sees cannot drift from what the reader sees, and
+# it does not care which function printed it.
+#
+# The exit code is deliberately not consulted: "systemctl is-active" exits 3 to
+# say "inactive", which is an answer, and "no reboot pending" is the healthy
+# case. What marks a check as missing is the collector saying so in words, which
+# is the same signal a human reads.
+#
+# It streams (fflush on every line) rather than buffering the bundle: a run cut
+# off halfway must still leave behind everything it had collected.
+# ponytail: one awk in the pipe, no counters to keep in sync anywhere else.
+coverage_tee() {
+  awk -v excluded="${AUDIT_EXCLUDED:-0}" '
+    { print; fflush() }
+    /^##### SECTION: / {
+      if (section != "" && gap > 0)
+        gaps = gaps (gaps == "" ? "" : ", ") section " (" (cmds - gap) "/" cmds ")"
+      section = substr($0, 16); cmds = 0; gap = 0; next
+    }
+    # One command can print several NOT VERIFIED lines (the per account key loop
+    # does): that is one check that did not happen, not five.
+    /^\$ / { cmds++; total++; seen = 0; next }
+    /NOT VERIFIED/ { if (!seen) { gap++; missing++; seen = 1 } next }
+    END {
+      if (section != "" && gap > 0)
+        gaps = gaps (gaps == "" ? "" : ", ") section " (" (cmds - gap) "/" cmds ")"
+      verified = total - missing
+      if (verified < 0) verified = 0
+      printf "\n\n##### SECTION: COVERAGE\n"
+      printf "Coverage: %d verified, %d not verified, %d excluded by contract.\n", \
+        verified, missing, excluded
+      if (gaps != "") printf "Sections with gaps: %s.\n", gaps
+    }'
+}
+
 # Prints at most <lines> of the output, then whatever the reader needs in order
 # not to mistake a list that stops for a list that ended.
 #
@@ -410,6 +474,27 @@ run_filtered() {
   out="$(printf '%s' "$out" | "$filter")"
   emit "$rc" "${2:-40}" "${3:-60}" "$(verdict_empty "$rc" "$out" '')"
   note_partial "$rc" "$out"
+}
+
+# run_if <tool> "command" [lines] [seconds]
+#
+# A tool that is not installed is not a check that failed. Ubuntu has no dnf and
+# the RHEL family has no apt, so running both and reading the absent one as a
+# gap puts a permanent hole in every report on whichever platform you are on,
+# and a hole that is always there is a hole nobody reads.
+#
+# It says NOT APPLICABLE and not NOT VERIFIED on purpose: the two look alike and
+# mean opposite things. "Not verified" is a question left unanswered, and the
+# audit owes you a second look. "Not applicable" is an answered question: there
+# is nothing of that kind on this machine.
+run_if() {   # <tool> <command> [lines] [seconds]
+  local tool="$1"; shift
+  if command -v "$tool" >/dev/null 2>&1; then
+    run "$@"
+  else
+    printf '\n$ %s\n' "$1"
+    printf 'NOT APPLICABLE: %s is not installed on this machine\n' "$tool"
+  fi
 }
 
 # check "command" "phrase if it succeeded but printed nothing" [lines] [seconds]
@@ -486,8 +571,16 @@ fi
 
 # =============================================================================
 # BODY
+#
+# Everything the body prints goes through coverage_tee, which passes it along
+# line by line and works out the coverage from what it saw. The whole body is
+# one group in a pipe rather than a captured variable: a run cut off halfway
+# (connection dropped, session killed) still leaves behind every line it had
+# already collected, which a variable would have swallowed.
 # =============================================================================
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+{
 
 # Directories the filesystem searches must not walk into: the container storage
 # directory holds millions of image-layer files, which alone would make the scan
@@ -513,13 +606,21 @@ sec "PENDING UPDATES"
 # An unpatched service is the most ordinary and most exploited way in.
 printf '\n$ reboot pending?\n%s\n' "$(verdict_reboot /var/run/reboot-required /var/run/reboot-required.pkgs)"
 run 'cat /var/run/reboot-required.pkgs 2>/dev/null' 12
-run 'apt list --upgradable 2>/dev/null | tail -n +2' 40 120
-run 'apt list --upgradable 2>/dev/null | grep -ci security || [ $? = 1 ]' 3 120
-run 'dnf -q check-update --security 2>/dev/null | head -20' 20 120
+# Guarded by the package manager that is actually here: one of the two families
+# is always absent, and reporting the absent one as a gap would leave a hole in
+# every report on whichever platform you happen to run.
+run_if apt 'set -o pipefail; apt list --upgradable 2>/dev/null | tail -n +2' 40 120
+run_if apt 'set -o pipefail; apt list --upgradable 2>/dev/null | grep -ci security || [ $? = 1 ]' 3 120
+run_if dnf 'dnf -q check-update --security 2>/dev/null' 20 120
 run 'cat /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null' 10
 run 'systemctl is-enabled unattended-upgrades 2>/dev/null; systemctl is-active unattended-upgrades 2>/dev/null' 4
-printf '\n$ last upgrades installed (package log, in date order)\n'
-zgrep -h " upgrade " /var/log/dpkg.log* 2>/dev/null | latest_upgrades
+# Through run_summary, not by hand: the summariser is a shell function, and run
+# executes its command in a fresh bash that has never seen it. Run by hand, an
+# absent zgrep or a missing package log printed nothing and was read as a check
+# that had been made.
+title 'last upgrades installed (package log, in date order)'
+run_summary latest_upgrades 'set -o pipefail; zgrep -h " upgrade " /var/log/dpkg.log* 2>/dev/null' \
+  'no package upgrade recorded in the log of this machine' 5
 
 sec "ACCOUNTS AND PRIVILEGES"
 # Who can become administrator, and in how many different ways.
@@ -530,7 +631,7 @@ run "awk -F: '\$3>=1000 && \$3<65534 {print \$1, \$3, \$7}' /etc/passwd" 20
 run "sudo -n awk -F: '{ if (\$2==\"\") print \$1\": NO PASSWORD\"; else if (\$2 ~ /^[!*]/) print \$1\": locked\"; else print \$1\": active (\"substr(\$2,1,3)\")\" }' /etc/shadow" 30
 run "sudo -n awk -F: '\$5==\"\" || \$5>365 {print \$1\": password expiry \"\$5\" days\"}' /etc/shadow" 25
 run 'getent group sudo wheel adm docker root' 8
-printf '\n$ summary of sudo rules (contents not reported)'
+title 'summary of sudo rules (contents not reported)'
 run_summary summarize_sudoers 'sudo -n grep -rhv "^#" /etc/sudoers /etc/sudoers.d/' \
   'the sudo configuration was read and holds no rule' 12
 # last and lastb print the host NAME when reverse resolution gives them one, and
@@ -583,9 +684,9 @@ run 'sudo -n ip6tables -S 2>/dev/null' 40
 # container port lives there as a redirection.
 run 'sudo -n iptables -t nat -S 2>/dev/null' 50
 run 'sudo -n ip6tables -t nat -S 2>/dev/null' 25
-run 'sudo -n nft list ruleset 2>/dev/null | head -40' 40
+run 'sudo -n nft list ruleset 2>/dev/null' 40
 run 'sudo -n ss -tulpn 2>/dev/null || ss -tulpn' 60
-printf '\n$ every listening socket, with what its address means'
+title 'every listening socket, with what its address means'
 # Retried without privileges, the way the log counts and the login history
 # already are: without passwordless sudo this whole section came back NOT
 # VERIFIED, while any account can list the same sockets and lose only the
@@ -660,8 +761,9 @@ check "sudo -n find /opt /home /root /etc -xdev -type f \\( -name 'id_rsa' -o -n
 run 'sudo -n ls -l /etc/shadow /etc/gshadow /etc/passwd /etc/group /etc/sudoers /etc/ssh/sshd_config 2>/dev/null' 12
 run 'sudo -n ls -ld /opt /opt/* /home/* 2>/dev/null' 30
 run 'mount | grep -E " /(tmp|var|var/log|var/tmp|home|boot|dev/shm) " ' 15
-printf '\n$ summary of /etc/fstab (device identifiers masked)\n'
-summarize_fstab < /etc/fstab 2>/dev/null | head -15
+title 'summary of /etc/fstab (device identifiers masked)'
+run_summary summarize_fstab 'cat /etc/fstab 2>/dev/null' \
+  '/etc/fstab is there and has no mount line' 15
 
 sec "ENCRYPTION AT REST"
 # Permissions stop a logged-in user. They stop nobody who holds the disk, or a
@@ -697,22 +799,22 @@ run 'systemctl list-units --type=service --state=running --no-pager --no-legend'
 run 'systemctl list-unit-files --state=enabled --no-pager --no-legend' 50
 run 'systemctl list-timers --all --no-pager --no-legend' 25
 run 'sudo -n ls -l /etc/cron.d/ /etc/cron.daily/ 2>/dev/null' 40
-printf '\n$ summary of system scheduled jobs (arguments not reported)'
+title 'summary of system scheduled jobs (arguments not reported)'
 run_summary "summarize_cron system" 'sudo -n cat /etc/crontab /etc/cron.d/*' \
   'the system crontabs were read and hold no job' 25
-printf '\n$ summary of this user scheduled jobs'
+title 'summary of this user scheduled jobs'
 run_summary "summarize_cron user" 'crontab -l 2>/dev/null || [ $? = 1 ]' \
   'this user has no personal crontab' 15
 
 sec "LOGGING AND TRACEABILITY"
 # If the server is broken into, the logs are the only possible reconstruction:
 # they have to be kept long enough and, ideally, off the machine as well.
-run 'systemctl is-active auditd 2>/dev/null; sudo -n auditctl -l 2>/dev/null | head -20' 25
+run 'systemctl is-active auditd 2>/dev/null; sudo -n auditctl -l 2>/dev/null' 25
 run 'grep -E "^(Storage|SystemMaxUse|MaxRetentionSec|ForwardToSyslog|Compress)" /etc/systemd/journald.conf 2>/dev/null' 10
 run 'journalctl --disk-usage 2>/dev/null' 3
 run 'ls /etc/logrotate.d/ 2>/dev/null' 40
 check 'grep -rhE "^[^#]*@@?[0-9a-zA-Z]" /etc/rsyslog.conf /etc/rsyslog.d/' 'no log forwarding to an external server' 12
-run 'sudo -n ls -l /var/log/ | head -25' 25
+run 'sudo -n ls -l /var/log/' 25
 
 sec "SECURITY TOOLING PRESENT"
 run 'for t in lynis rkhunter chkrootkit clamscan freshclam aide auditctl fail2ban-client ufw firewall-cmd nft iptables docker podman fapolicyd cryptsetup; do printf "%-16s %s\\n" "$t" "$(command -v $t 2>/dev/null || echo ABSENT)"; done' 20
@@ -721,7 +823,13 @@ check 'ls -l /var/log/lynis* /var/log/rkhunter* 2>/dev/null' 'no local scan reco
 sec "NETWORK AND EXPOSURE"
 run 'ip -brief address' 15
 run 'ip route' 10
-run_filtered mask_ip 'sudo -n ss -tn state established 2>/dev/null | head -20' 22
+run_filtered mask_ip 'sudo -n ss -tn state established 2>/dev/null' 22
 run 'grep -v "^#" /etc/resolv.conf 2>/dev/null' 10
+
+} | coverage_tee
+
+printf '\nNot attempted at all, by contract. These are categories of action, not\n'
+printf 'commands, so they are not part of the two counts above:\n'
+excluded_by_contract
 
 printf '\n\n##### END OF COLLECTION\n'

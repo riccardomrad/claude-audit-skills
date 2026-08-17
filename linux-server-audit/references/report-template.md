@@ -13,11 +13,29 @@ Collection: <bundle file used>, <time>
 Compared with: <previous audit, or "first audit, no comparison">
 Every check was read only: nothing was modified, restarted or deleted.
 
+Coverage: <N> verified, <M> not verified, <K> excluded by contract.
+Sections with gaps: <section (verified/total), only when M is greater than zero>
+
+<Copy the coverage line from the COVERAGE section at the end of the bundle, and
+the gaps line with it when the bundle has one: it is printed only when
+something is missing, so on a run with no gaps there is nothing to copy and the
+second line is left out.
+
+The collector counted, so there is no need to recount, but the count is meant to
+be checkable and you are welcome to check it: the verified number is the number
+of "$ " lines minus the number of checks that came back NOT VERIFIED. If your
+own count disagrees with the line, say so in the report rather than picking
+whichever number you prefer.>
+
 ## In two lines
 
-<General state in human words. Example: "The server is in good shape: the front
-door is locked and updates are recent. Two things need fixing tonight, four can
-wait.">
+<General state in human words, bounded by what was actually verified. Example:
+"No problem found among the 78 checks that could be verified. Nine checks could
+not run, all in the container section, so nothing is known about that side.">
+
+No clean bill of health: no adjective that declares the machine as a whole safe,
+sound, healthy or free of problems. The audit knows which checks it ran and what
+they said, and that is the only thing it may state.
 
 ## Fix now
 
@@ -25,7 +43,9 @@ wait.">
 |---|------|----------|---------------------|---------------|
 | 1 | <short description> | CRITICAL | <in plain words> | <command or step, with the risk of the change> |
 
-If the table is empty, say so in words: "Nothing to fix right now."
+If the table is empty, say so bounded: "No finding among the checks that were
+verified." An empty table with checks left unverified is not a quiet server, it
+is a partial audit, and the coverage line above says which one you are reading.
 
 **How each row is written.** Borrow the discipline of a vulnerability report,
 because a finding is worth only what the reader can act on (Li ch. 2):

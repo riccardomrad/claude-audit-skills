@@ -540,6 +540,38 @@ else
 fi
 
 echo
+echo '=== FAMILY: no report template may offer a clean bill of health ==='
+# The same family test the server suite runs, on this skill's own template.
+# The forbidden phrase that matters most here is "nothing sent": the collector
+# sends dozens of read requests, and they show up in the site's own logs.
+for forbidden in 'in good shape' 'Nothing to fix right now' 'nothing sent' \
+                 'is clean' 'is protected' 'all clear'; do
+  if grep -qiF "$forbidden" "$TEMPLATE"; then
+    ko=$((ko+1)); printf 'KO    template must not suggest [%s]\n' "$forbidden"
+  else
+    ok=$((ok+1)); printf 'ok    template does not suggest [%s]\n' "$forbidden"
+  fi
+done
+file_has 'the template opens with what could not be checked' \
+  'What could not be checked' "$TEMPLATE"
+file_has 'the template says the read requests do reach the site' \
+  'appear in its logs' "$TEMPLATE"
+# Not everything this collector sends goes to the audited site. The name of the
+# host is resolved through a public resolver, so a customer's internal hostname
+# leaves for a third party. Naming only what reaches the site would be the same
+# half truth as the sentence this test replaced.
+file_has 'the template says the hostnames leave for the public resolver' \
+  'Cloudflare' "$TEMPLATE"
+# This collector does not count for the writer yet. A template that demands a
+# number nobody can derive gets a number somebody invented, in a document that
+# goes to a customer: so it asks for the list of checks that did not run, which
+# is read off the bundle, and not for a count.
+file_lacks 'the template does not ask for a coverage number it cannot supply' \
+  'Coverage: <N> verified' "$TEMPLATE"
+file_has 'the template asks instead for what could not be checked' \
+  'every NOT VERIFIED line' "$TEMPLATE"
+
+echo
 printf 'TESTS: %d passed, %d failed (%d total)\n' "$ok" "$ko" "$((ok+ko))"
 [ "$ko" -eq 0 ] || exit 1
 exit 0

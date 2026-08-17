@@ -101,7 +101,16 @@ Practical notes, learned the hard way:
   without ever learning what is actually missing.
 - The bundle can carry a list followed by `(the command also reported an error:
   the result may be incomplete)`. Those lines are real: judge them, and treat the
-  section as possibly partial. Only `NOT VERIFIED` means the check never ran.
+  section as possibly partial. Only `NOT VERIFIED` means the check never ran:
+  `NOT APPLICABLE` is the opposite, an answered question (the tool is not on this
+  machine, so there is nothing of that kind to look at).
+- The bundle ends with a `COVERAGE` section: how many checks were verified, how
+  many were not, and which sections lost something. Copy that line into the top
+  of the report before writing anything else, and let it bound every sentence
+  you write: with checks left unverified you may report what you found, never
+  that the machine is fine. The count is checkable, and meant to be: the verified
+  number is the number of `$ ` lines minus the checks that came back
+  `NOT VERIFIED`.
 - The collector always uses `sudo -n`, so a command never hangs waiting for a
   password prompt that will never be answered (verified in the field).
 - If the connection fails, stop and report the exact error. Do not try other
