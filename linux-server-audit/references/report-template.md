@@ -58,6 +58,13 @@ or drop it entirely.
 Short, concrete list, so it is clear what was actually looked at:
 - SSH access: <one line result>
 - Firewall and exposed ports: <result>
+- Listening sockets: <how many reachable from outside, how many local only, how
+  many to verify, how many unrecognised. The numbers come from the collector,
+  which classifies every socket it printed: never report only the ones bound to
+  the wildcard address. If that section carries the note that the list is cut,
+  the numbers are a floor and not a count: write them as "at least N" and repeat
+  the section under "What I could NOT check". A socket with an unrecognised
+  address belongs to no category: name it there too>
 - Containers: <result>
 - Updates: <result>
 - Permissions and sensitive files: <result>

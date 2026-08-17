@@ -215,6 +215,39 @@ firewall actually contains.
   can hide its own sockets from local tools, so an external port scan is the
   second opinion the machine cannot fake (Tevault ch. 16).
 
+Each listening socket now carries what its address means. The label states which
+address the service is bound to, which is a fact the collector reads; whether a
+packet from the internet actually arrives depends on the firewall, which is
+section 4. Read the two together, and settle the question with an external scan
+(Tevault ch. 4, ch. 16, verified in the field):
+
+- `REACHABLE FROM OUTSIDE (wildcard address)`: the service answers on every
+  address of the machine. Fine for the reverse proxy and for SSH, a finding for
+  anything else, and **CRITICAL** for a database, a queue or an admin interface
+  once the firewall is confirmed not to be stopping it.
+- `REACHABLE FROM OUTSIDE (routable address)`: the service is bound straight to
+  a public address of the host. Same judgement as above, and worth reading twice
+  for one reason: a published container port is written into the NAT table and
+  does not pass through the front end whose status you just read, so a ruleset
+  that looks correct can still be letting this through (section 6).
+- `TO VERIFY (private address: reachable from that network)`: usually a container
+  bridge or a mesh VPN. Not a finding on its own, but it is not "safe" either: it
+  says the service answers to whoever sits on that network, containers included.
+  Compare it with the published container ports in section 6.
+- `TO VERIFY (multicast or reserved address: not an ordinary service)`: a
+  discovery responder (mDNS, SSDP) answering the local network. Not a finding.
+  Worth one look only if you did not expect that service to exist at all.
+- `LOCAL ONLY`: bound to loopback, reachable only from the machine itself.
+- `UNRECOGNISED ADDRESS SHAPE (check it on the server)`: the collector could not
+  read the address. It belongs to no count: go and look, and list it under what
+  could not be checked. Never round it down to "fine".
+
+An unprivileged listing is still a complete list of sockets: what it loses is the
+process attribution, the name of the program behind sockets the account does not
+own. So a line whose process column says the listing was read without privileges
+is a socket you know about and a program you do not: chase the program, do not
+discount the socket. And never read a missing line as a closed port.
+
 ## 6. Containers
 
 - **A container that mounts the host root, or the host configuration directory,

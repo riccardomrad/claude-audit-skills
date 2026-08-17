@@ -182,12 +182,159 @@ tcp   LISTEN 0      128    [::]:443            [::]:*            users:(("proxy"
 tcp   LISTEN 0      128    [::1]:9000          [::]:*            users:(("php",pid=5,fd=4))
 udp   UNCONN 0      0      127.0.0.53%lo:53    0.0.0.0:*         users:(("resolved",pid=6,fd=12))'
 ports="$(printf '%s\n' "$fake_ss" | public_ports)"
-lacks   'a port on loopback is not public'        '5432' "$ports"
-lacks   'a port on IPv6 loopback is not public'   '9000' "$ports"
-lacks   'the local resolver port is not public'   ':53'  "$ports"
-contains 'port 80 on the wildcard is public'      '80'   "$ports"
-contains 'port 8080 in *:port form is public'     '8080' "$ports"
-contains 'port 443 on the IPv6 wildcard is public' '443' "$ports"
+# A loopback socket is listed, and the thing that must never happen is calling
+# it reachable. Checking that the line is absent was the old shape of this
+# check, back when the listing dropped everything but wildcard binds: a socket
+# nobody prints is a socket nobody judges.
+contains 'a port on loopback is listed as local only' \
+  'port 5432  users:(("postgres",pid=1,fd=7))  LOCAL ONLY' "$ports"
+contains 'a port on IPv6 loopback is listed as local only' \
+  'port 9000  users:(("php",pid=5,fd=4))  LOCAL ONLY' "$ports"
+contains 'the local resolver port is listed as local only' \
+  'port 53  users:(("resolved",pid=6,fd=12))  LOCAL ONLY' "$ports"
+lacks   'no loopback socket is called reachable from outside' \
+  'port 5432  users:(("postgres",pid=1,fd=7))  REACHABLE' "$ports"
+# Full lines, not bare port numbers: matching '80' alone also matches the 8080
+# line, so the assertion stayed green even with the port 80 socket gone.
+contains 'port 80 on the wildcard is public' \
+  'port 80  users:(("nginx",pid=2,fd=6))  REACHABLE FROM OUTSIDE (wildcard address)' "$ports"
+contains 'port 8080 in *:port form is public' \
+  'port 8080  users:(("java",pid=3,fd=9))  REACHABLE FROM OUTSIDE (wildcard address)' "$ports"
+contains 'port 443 on the IPv6 wildcard is public' \
+  'port 443  users:(("proxy",pid=4,fd=3))  REACHABLE FROM OUTSIDE (wildcard address)' "$ports"
+
+echo
+echo '=== PORTS: every listening address is classified ==='
+# The addresses here are documentation addresses (RFC 5737 and RFC 1918), not
+# the address of any real host: this file is public.
+fake_ss='Netid State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
+tcp   LISTEN 0      128    0.0.0.0:22          0.0.0.0:*  users:(("sshd",pid=1,fd=3))
+tcp   LISTEN 0      128    203.0.113.10:5432   0.0.0.0:*  users:(("postgres",pid=2,fd=4))
+tcp   LISTEN 0      128    127.0.0.1:6379      0.0.0.0:*  users:(("redis",pid=3,fd=5))
+tcp   LISTEN 0      128    172.17.0.1:9000     0.0.0.0:*  users:(("dockerd",pid=4,fd=6))'
+
+out="$(printf '%s\n' "$fake_ss" | public_ports)"
+contains 'ports: a wildcard bind is reachable from outside' \
+  'port 22  users:(("sshd",pid=1,fd=3))  REACHABLE FROM OUTSIDE (wildcard address)' "$out"
+contains 'ports: a bind to a routable address of the host is reachable from outside' \
+  'port 5432  users:(("postgres",pid=2,fd=4))  REACHABLE FROM OUTSIDE (routable address)' "$out"
+contains 'ports: a loopback bind is local only' \
+  'port 6379  users:(("redis",pid=3,fd=5))  LOCAL ONLY' "$out"
+contains 'ports: a private address is not silently called safe' \
+  'port 9000  users:(("dockerd",pid=4,fd=6))  TO VERIFY (private address: reachable from that network)' "$out"
+expect 'ports: no listening socket disappears from the listing' \
+  '4' "$(printf '%s\n' "$out" | grep -c 'port ')"
+
+# Carrier grade NAT (RFC 6598) is the address family a mesh VPN hands out, and
+# on the first real run it was the one address shape that came back wrong: a
+# socket reachable only from the VPN was reported as reachable from the
+# internet. A false alarm is cheaper than a miss, but it is still the report
+# saying something that is not true (verified in the field).
+cgnat='Netid State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
+tcp   LISTEN 0      128    100.64.0.1:50049    0.0.0.0:*  users:(("tailscaled",pid=7,fd=1))
+tcp   LISTEN 0      128    100.127.255.254:993 0.0.0.0:*  users:(("mesh",pid=8,fd=2))
+tcp   LISTEN 0      128    100.63.0.1:993      0.0.0.0:*  users:(("real",pid=9,fd=3))
+tcp   LISTEN 0      128    100.128.0.1:993     0.0.0.0:*  users:(("real",pid=10,fd=4))'
+out="$(printf '%s\n' "$cgnat" | public_ports)"
+contains 'ports: the bottom of the CGNAT range is not called internet reachable' \
+  'port 50049  users:(("tailscaled",pid=7,fd=1))  TO VERIFY (private address: reachable from that network)' "$out"
+contains 'ports: the top of the CGNAT range is not called internet reachable' \
+  'port 993  users:(("mesh",pid=8,fd=2))  TO VERIFY (private address: reachable from that network)' "$out"
+contains 'ports: the address just below the CGNAT range is still routable' \
+  'port 993  users:(("real",pid=9,fd=3))  REACHABLE FROM OUTSIDE (routable address)' "$out"
+contains 'ports: the address just above the CGNAT range is still routable' \
+  'port 993  users:(("real",pid=10,fd=4))  REACHABLE FROM OUTSIDE (routable address)' "$out"
+
+# A dual stack service binds an IPv4 address through an IPv6 socket, and the
+# address arrives wrapped. Judged on the wrapper it looks public, so a service
+# listening on loopback only gets reported as an exposure.
+# The scope id (%lo, %eth0) is part of the same problem: it decorates the
+# address without changing which address it is.
+odd='Netid State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
+tcp   LISTEN 0      128    [::ffff:127.0.0.1]:8180  0.0.0.0:*  users:(("crowdsec",pid=11,fd=1))
+tcp   LISTEN 0      128    [::ffff:10.0.0.5]:9090   0.0.0.0:*  users:(("exporter",pid=12,fd=2))
+udp   UNCONN 0      0      *%eth0:546               0.0.0.0:*  users:(("dhcp6",pid=13,fd=3))
+tcp   LISTEN 0      128    weird                    0.0.0.0:*  users:(("mystery",pid=14,fd=4))'
+out="$(printf '%s\n' "$odd" | public_ports)"
+contains 'ports: an IPv4 loopback wrapped in an IPv6 socket stays local only' \
+  'port 8180  users:(("crowdsec",pid=11,fd=1))  LOCAL ONLY' "$out"
+contains 'ports: a private IPv4 wrapped in an IPv6 socket stays to verify' \
+  'port 9090  users:(("exporter",pid=12,fd=2))  TO VERIFY (private address: reachable from that network)' "$out"
+contains 'ports: a wildcard carrying a scope id is still a wildcard' \
+  'port 546  users:(("dhcp6",pid=13,fd=3))  REACHABLE FROM OUTSIDE (wildcard address)' "$out"
+contains 'ports: an address we cannot read is not quietly called public' \
+  'users:(("mystery",pid=14,fd=4))  UNRECOGNISED ADDRESS SHAPE (check it on the server)' "$out"
+
+# A multicast responder answers the local network, not the internet. Called
+# reachable from outside it becomes an unexplained public service, which the
+# criteria then rate HIGH: a loud alarm about a printer discovery daemon.
+mcast='Netid State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
+udp   UNCONN 0      0      224.0.0.251:5353    0.0.0.0:*  users:(("avahi",pid=15,fd=1))
+udp   UNCONN 0      0      239.255.255.250:1900 0.0.0.0:* users:(("ssdp",pid=16,fd=2))
+udp   UNCONN 0      0      [ff02::fb]:5353     0.0.0.0:*  users:(("avahi",pid=17,fd=3))
+tcp   LISTEN 0      128    223.0.0.1:443       0.0.0.0:*  users:(("real",pid=18,fd=4))'
+out="$(printf '%s\n' "$mcast" | public_ports)"
+contains 'ports: an IPv4 multicast responder is not called internet reachable' \
+  'port 5353  users:(("avahi",pid=15,fd=1))  TO VERIFY (multicast or reserved address: not an ordinary service)' "$out"
+contains 'ports: an SSDP responder is not called internet reachable' \
+  'port 1900  users:(("ssdp",pid=16,fd=2))  TO VERIFY (multicast or reserved address: not an ordinary service)' "$out"
+contains 'ports: an IPv6 multicast responder is not called internet reachable' \
+  'port 5353  users:(("avahi",pid=17,fd=3))  TO VERIFY (multicast or reserved address: not an ordinary service)' "$out"
+contains 'ports: the address just below the multicast range is still routable' \
+  'port 443  users:(("real",pid=18,fd=4))  REACHABLE FROM OUTSIDE (routable address)' "$out"
+
+# The raw listing sits one line above the classified one and reads the same
+# sockets. Without the same fallback the bundle carries two answers to one
+# question in one section: "NOT VERIFIED" above, a full list below.
+file_has 'ports: the raw listing is retried without privileges too' \
+  "run 'sudo -n ss -tulpn 2>/dev/null \|\| ss -tulpn'" "$COLLECT"
+
+# The documents that turn these labels into a verdict have to describe the
+# labels that exist, and stop asserting what the collector cannot know.
+file_lacks 'checks: the firewall is not declared powerless against a public bind' \
+  'does not undo this bind' "$CHECKS"
+file_has 'checks: reachability is stated as depending on the firewall' \
+  'depends on the firewall' "$CHECKS"
+file_lacks 'checks: an unprivileged listing is not called a partial socket list' \
+  'the section is partial and says so' "$CHECKS"
+file_has 'checks: what an unprivileged listing loses is named exactly' \
+  'process attribution' "$CHECKS"
+file_has 'checks: the unrecognised label has a rule of its own' \
+  'UNRECOGNISED ADDRESS SHAPE' "$CHECKS"
+file_has 'checks: the multicast label has a rule of its own' \
+  'multicast or reserved address' "$CHECKS"
+file_has 'template: a cut socket list is reported as a floor, not as a count' \
+  'at least' "$TEMPLATE"
+
+# The classified list may never be shorter than the raw listing printed just
+# above it: it now prints one line per socket instead of one per wildcard bind,
+# and the report is told to count the categories. Counting a cut list and
+# stating the result as a fact is the defect this whole phase exists to close.
+# Read as "the last field of the last line of the call", not as "the line after
+# the call": the second form measures whatever happens to follow if the call is
+# ever reflowed onto one line, and this is the guard protecting the central
+# claim of the whole change.
+raw_cap="$(awk "/^run 'sudo -n ss -tulpn/ {print \$NF}" "$COLLECT")"
+classified_cap="$(awk '/run_summary public_ports/ {f=1} f && NF {last=$NF} f && !NF {exit} END {print last}' "$COLLECT")"
+if [ "${classified_cap:-0}" -ge "${raw_cap:-0}" ] 2>/dev/null && [ "${classified_cap:-0}" -ge 60 ]; then
+  ok=$((ok+1)); printf 'ok    ports: the classified list is not cut shorter than the raw one\n'
+else
+  ko=$((ko+1)); printf 'KO    ports: the classified list is cut shorter than the raw one\n        raw cap [%s], classified cap [%s]\n' "${raw_cap:-none}" "${classified_cap:-none}"
+fi
+
+# Without passwordless sudo the whole section comes back NOT VERIFIED, while any
+# account can read the same sockets unprivileged and lose only the process
+# names. The collector already retries this way for the log counts and the login
+# history, and the "process not visible" branch cannot fire without it.
+file_has 'ports: the listing is retried without privileges' \
+  'run_summary public_ports .sudo -n ss -tulpn 2>/dev/null \|\| ss -tulpn' "$COLLECT"
+# The heading and the empty-case phrase describe the filter that used to be
+# there. A heading that lies about what you are looking at is the same defect in
+# a smaller format, so they may not survive the filter they described.
+file_lacks 'ports: the heading no longer claims the listing is filtered' \
+  'local column only' "$COLLECT"
+file_lacks 'ports: the empty case no longer claims nothing is bound to a public address' \
+  'nothing is bound to a public address' "$COLLECT"
 
 echo
 echo '=== COLLECTOR: SSH keys and honest verdicts ==='

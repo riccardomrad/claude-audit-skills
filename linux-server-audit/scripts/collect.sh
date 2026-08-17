@@ -165,16 +165,59 @@ summarize_fstab() {
 # Taking the last field regardless prints "0.0.0.0:*" in the process slot, which
 # reads as a service by that name. Better to say the process was not visible: a
 # missing name sends you back to the server, an invented one does not.
+#
+# Every listening socket is printed, with the address it is bound to and what
+# that address means. The previous version printed wildcard binds only, so a
+# service bound straight to the public address of the host was missing from the
+# list of public ports: the single worst blind spot this collector could have,
+# since it is exactly the accident the audit exists to catch (verified in the
+# field).
+#
+# The classification reads the shape of the address and nothing else. It does
+# not need to know which address belongs to this host, which keeps the function
+# a pure filter the tests can feed by hand.
+# ponytail: shape based classification, revisit if a host uses addresses that do
+# not fall into these families.
 public_ports() {
   awk '
+    function classify(a,   b) {
+      # An address we cannot read gets its own label rather than the loudest
+      # one. Falling through to "reachable from outside" would invent a public
+      # port with an empty address column, and the rule in this file is that a
+      # missing name sends you back to the server while an invented one does not.
+      if (a == "") return "UNRECOGNISED ADDRESS SHAPE (check it on the server)"
+      # Two decorations change how an address looks without changing which
+      # address it is: the scope id (127.0.0.53%lo, *%eth0) and the IPv6 wrapper
+      # a dual stack service gets when it binds an IPv4 address
+      # ([::ffff:127.0.0.1]). Judged on the wrapper, a service listening on
+      # loopback only is reported as an exposure.
+      b = a
+      sub(/%[A-Za-z0-9._-]+/, "", b)
+      if (b ~ /^\[?::ffff:/) { sub(/^\[?::ffff:/, "", b); sub(/\]$/, "", b) }
+      if (b == "0.0.0.0" || b == "*" || b == "[::]" || b == "::")
+        return "REACHABLE FROM OUTSIDE (wildcard address)"
+      if (b ~ /^127\./ || b == "[::1]" || b == "::1")
+        return "LOCAL ONLY"
+      # Multicast and the reserved space are not addresses anyone dials from the
+      # internet: a printer discovery daemon or an SSDP responder answers the
+      # local network. Left in the routable branch it becomes an unexplained
+      # public service, and the criteria rate those HIGH.
+      if (b ~ /^(22[4-9]|2[345][0-9])\./ || b ~ /^\[?ff/)
+        return "TO VERIFY (multicast or reserved address: not an ordinary service)"
+      if (b ~ /^10\./ || b ~ /^192\.168\./ || b ~ /^169\.254\./ ||
+          b ~ /^172\.(1[6-9]|2[0-9]|3[01])\./ ||
+          b ~ /^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\./ ||
+          b ~ /^\[?f[cde]/)
+        return "TO VERIFY (private address: reachable from that network)"
+      return "REACHABLE FROM OUTSIDE (routable address)"
+    }
     $1 ~ /^(tcp|udp)$/ {
       loc = $5
       n = split(loc, p, ":")
       port = p[n]
       address = substr(loc, 1, length(loc) - length(port) - 1)
       process = (NF >= 7 ? $7 : "(process not visible: the listing was read without privileges)")
-      if (address == "0.0.0.0" || address == "*" || address == "[::]" || address == "::")
-        printf "%s  %s  port %s  %s\n", $1, address, port, process
+      printf "%s  %s  port %s  %s  %s\n", $1, address, port, process, classify(address)
     }'
 }
 
@@ -541,10 +584,17 @@ run 'sudo -n ip6tables -S 2>/dev/null' 40
 run 'sudo -n iptables -t nat -S 2>/dev/null' 50
 run 'sudo -n ip6tables -t nat -S 2>/dev/null' 25
 run 'sudo -n nft list ruleset 2>/dev/null | head -40' 40
-run 'sudo -n ss -tulpn 2>/dev/null' 60
-printf '\n$ ports listening on ALL addresses (local column only)'
-run_summary public_ports 'sudo -n ss -tulpn' \
-  'the socket listing was read and nothing is bound to a public address' 40
+run 'sudo -n ss -tulpn 2>/dev/null || ss -tulpn' 60
+printf '\n$ every listening socket, with what its address means'
+# Retried without privileges, the way the log counts and the login history
+# already are: without passwordless sudo this whole section came back NOT
+# VERIFIED, while any account can list the same sockets and lose only the
+# process names, which the line itself then says.
+# The cap is well above the raw listing above: this prints one line per socket
+# now, not one per wildcard bind, and the report is told to count the
+# categories. A count taken from a cut list is a number stated as a fact.
+run_summary public_ports 'sudo -n ss -tulpn 2>/dev/null || ss -tulpn' \
+  'the socket listing was read and nothing is listening at all' 150
 
 sec "CONTAINERS"
 run 'sudo -n docker version --format "{{.Server.Version}}" 2>/dev/null; sudo -n docker info 2>/dev/null | grep -Ei "storage driver|cgroup version|rootless|userns|live restore|security options" ' 15
