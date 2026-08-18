@@ -3,8 +3,15 @@
 # web-security-audit: READ-ONLY collection against one web property you own.
 #
 # It makes read requests only (GET, HEAD, OPTIONS). No payloads, no login
-# attempts, no data sent, no writes, no fuzzing, no bursts: there is a pause
-# between requests. It reads what the site answers to anybody.
+# attempts, no data sent, no writes, no bursts: there is a pause between
+# requests. It reads what the site answers to anybody.
+#
+# It does ask for a fixed, short list of well known paths that should not answer
+# (/.git/HEAD, /.env, /backup.zip, /admin: about forty in all, plus eight
+# directories asked for a listing, all written out further down this file).
+# They are plain read requests and they
+# break nothing, but they are guesses: a line here claiming this tool never
+# guesses an address would be a promise the code below does not keep.
 #
 # It refuses any host that is not in the domain list of the audit profile: a
 # checking tool pointed at somebody else's site by mistake is not a technical
@@ -186,6 +193,30 @@ page_unreachable_note() {   # <left scope flag> <address the chain stopped at>
 # The tests set it to zero.
 pause() { sleep "${AUDIT_PAUSE:-0.4}" 2>/dev/null || true; }
 
+# Says out loud that a list was cut. A list that stops without saying so reads
+# as a list that ended, and an audit that names "the headers" having seen the
+# first fifty is the exact failure these skills exist to avoid. Same shape as
+# emit() in the server collector, so the two bundles read alike: what was shown,
+# out of how much, and what the reader is therefore not looking at.
+cut_note() {   # cut_note <shown> <total> <the rest of the sentence>
+  [ "${2:-0}" -gt "${1:-0}" ] 2>/dev/null || return 0
+  printf '(only the first %s out of %s %s)\n' "$1" "$2" "$3"
+  return 0
+}
+
+# Prints at most <lines> lines of what it is given, then the note if it cut.
+# The cut has to happen HERE and not inside the command that produced the list:
+# a command that pipes into head hands over exactly <lines> lines, so nothing
+# downstream can tell a list that was cut from a list that ended.
+show_first() {   # show_first <lines> <the rest of the sentence>   (reads stdin)
+  local lines="$1" all total
+  all="$(cat)"
+  [ -n "$all" ] || return 0
+  printf '%s\n' "$all" | head -n "$lines"
+  total="$(printf '%s\n' "$all" | wc -l | tr -d '[:space:]')"
+  cut_note "$lines" "$total" "$2"
+}
+
 # The address every later request must start from: the one the visitor actually
 # lands on, not the one that was typed. A site that answers on the bare domain
 # and serves on www redirects every single path, so asking the typed address
@@ -240,6 +271,49 @@ extract_script_srcs() {   # <html file>
     | grep -E '\.js([?#][^[:space:]]*)?$'
 }
 
+# Queues at most <max> of the scripts THIS HOST serves, and says out loud how
+# many it left behind. Two things here are deliberate.
+#
+# The cut happens after the third party ones are set aside, not before. A page
+# whose first six script tags point at a CDN is the ordinary shape of the web:
+# cutting first would spend the whole budget on files this tool never fetches,
+# leave the secret search with the home page alone, and still let the bundle
+# say six scripts were taken.
+#
+# And the ones left behind are never downloaded, so they are never searched.
+# Without the note the section below would print "no recognisable secret in the
+# pages that were read" after opening six files out of nineteen, which is a
+# clean bill of health for thirteen files nobody looked at.
+pick_scripts() {   # pick_scripts <html file> <max> <outfile> <host>
+  local js url taken=0 mine=0 listed=0 others=0
+  : > "$3"
+  # The same file included ten times is one file, read once: counting tags
+  # instead of files announces a cut that never happened and spends the budget
+  # asking the same address over and over, from a tool whose first promise is
+  # not to look like a scan.
+  while IFS= read -r js; do
+    [ -n "$js" ] || continue
+    url="$(script_url_to_fetch "$js" "$4")"
+    if [ -z "$url" ]; then
+      others=$((others+1))
+      if [ "$listed" -lt "$2" ]; then
+        printf '[third party script: listed, NOT downloaded] %s\n' "$js"
+        listed=$((listed+1))
+      fi
+      continue
+    fi
+    mine=$((mine+1))
+    if [ "$taken" -lt "$2" ]; then
+      printf '%s\n' "$url" >> "$3"
+      taken=$((taken+1))
+    fi
+  done <<EOF
+$(extract_script_srcs "$1" | awk '!seen[$0]++')
+EOF
+  cut_note "$2" "$others" 'third party scripts are listed: the rest were not'
+  cut_note "$2" "$mine" 'scripts served by this host were read: the rest were not'
+}
+
 # Prints the address to download ONLY if it lives on the host being audited. A
 # script hosted by a third party is reported and left alone: fetching it would
 # be a request to somebody else's site.
@@ -268,7 +342,25 @@ cookie_lines() {   # <headers text>
     return 0
   fi
   local c
-  c="$(printf '%s\n' "$1" | tr -d '\r' | grep -i '^set-cookie:' | cut -c1-200)"
+  # The attributes that decide whether a cookie is safe (HttpOnly, Secure,
+  # SameSite) sit at the END of the line, and a session cookie carrying a token
+  # is easily three hundred characters. Cutting the line at a fixed width ate
+  # exactly those attributes, so a site that had them right was reported as
+  # missing them: a HIGH finding invented by the tool. The value is the only
+  # part with no natural length, so the value is what gets shortened, the same
+  # way a secret found inside a page is.
+  c="$(printf '%s\n' "$1" | tr -d '\r' | grep -i '^set-cookie:' | awk '
+    {
+      eq = index($0, "=")
+      semi = index($0, ";")
+      if (eq > 0 && (semi == 0 || semi > eq)) {
+        stop = (semi > 0 ? semi : length($0) + 1)
+        val = substr($0, eq + 1, stop - eq - 1)
+        if (length(val) > 24)
+          $0 = substr($0, 1, eq) sprintf("%s...(%d characters)", substr(val, 1, 12), length(val)) substr($0, stop)
+      }
+      print
+    }')"
   if [ -n "$c" ]; then printf '%s' "$c"; else printf 'the home page sets no cookie'; fi
 }
 
@@ -387,8 +479,17 @@ last_header_block() {   # <headers dump>
     | awk '/^HTTP\//{ buf=""; next } { buf = buf $0 "\n" } END { printf "%s", buf }'
 }
 
+# A policy shown cut reads as a policy that ends there, and the analyst is asked
+# to judge whether a directive is inside it: a long content-security-policy
+# whose frame-ancestors sits past the cut becomes "frame-ancestors is missing",
+# a finding the site does not deserve.
 header_value() {   # <header name> <headers dump>
-  last_header_block "$2" | grep -Ei "^$1:" | head -1 | cut -c1-300
+  local v
+  v="$(last_header_block "$2" | grep -Ei "^$1:" | head -1)"
+  [ -n "$v" ] || return 0
+  printf '%s' "$v" | cut -c1-300
+  [ "${#v}" -gt 300 ] && printf ' (cut at 300 characters out of %s: the rest of this header was not shown)' "${#v}"
+  return 0
 }
 
 verdict_tls() {   # <rc> <openssl output>
@@ -428,8 +529,13 @@ find_secrets() {   # <file> [extra pattern ...]
     # -e and -- keep a pattern that begins with a dash from being read as an
     # option: the extra patterns come from the profile, and a profile is edited
     # by hand.
-    out="$(grep -Eiao -e "$pat" -- "$f" 2>/dev/null | sort -u | head -5 | mask_value)"
-    [ -n "$out" ] && printf 'FOUND with the pattern: %s\n%s\n' "$pat" "$out"
+    out="$(grep -Eiao -e "$pat" -- "$f" 2>/dev/null | sort -u)"
+    [ -n "$out" ] || continue
+    # Five is plenty to prove the problem, but a page leaking forty keys under
+    # one pattern must not read as a page leaking five: this is the one section
+    # where somebody counts what is on the page.
+    printf 'FOUND with the pattern: %s\n%s\n' "$pat"       "$(printf '%s\n' "$out" | head -5 | mask_value)"
+    cut_note 5 "$(printf '%s\n' "$out" | grep -c . || :)"       'matches are shown: the list is cut'
   done
   return 0
 }
@@ -764,7 +870,7 @@ elif [ "$FOLLOW_RC" -eq 0 ]; then
   printf '%s\n' "$FOLLOW_HEADERS" > "$tmp/headers.txt"
   cp "$tmp/chain-body.bin" "$tmp/home.html" 2>/dev/null || : > "$tmp/home.html"
 fi
-head -50 "$tmp/headers.txt" 2>/dev/null
+cat "$tmp/headers.txt" 2>/dev/null | show_first 50 'header lines are shown: the list is cut'
 printf '\n[home page size] %s bytes\n' "$(wc -c < "$tmp/home.html" 2>/dev/null || echo 0)"
 pause
 
@@ -785,7 +891,7 @@ if [ ! -s "$tmp/headers.txt" ]; then
   echo 'NOT VERIFIED: no answer was received, so there is nothing to read here'
 else
   grep -Ei '^(server|x-powered-by|x-aspnet|x-generator|via|x-served-by|x-cache|cf-ray|cf-cache-status|x-vercel|x-nginx):' \
-    "$tmp/headers.txt" 2>/dev/null | head -12
+    "$tmp/headers.txt" 2>/dev/null | show_first 12 'lines are shown: the list is cut'
   grep -Eio '<meta[^>]+generator[^>]*>' "$tmp/home.html" 2>/dev/null | head -3
 fi
 
@@ -916,14 +1022,9 @@ sec "SECRETS AND INTERNAL ADDRESSES INSIDE PAGES"
 # this tool never makes.
 # Results are MASKED: first characters and length, never the value.
 cp "$tmp/home.html" "$tmp/all.txt" 2>/dev/null || : > "$tmp/all.txt"
-extract_script_srcs "$tmp/home.html" | head -6 > "$tmp/scripts.txt"
-while read -r js; do
-  [ -n "$js" ] || continue
-  url="$(script_url_to_fetch "$js" "$host")"
-  if [ -z "$url" ]; then
-    printf '[third party script: listed, NOT downloaded] %s\n' "$js"
-    continue
-  fi
+pick_scripts "$tmp/home.html" 6 "$tmp/scripts.txt" "$host"
+while read -r url; do
+  [ -n "$url" ] || continue
   printf '[script read] %s\n' "$url"
   "${C[@]}" "$url" 2>/dev/null >> "$tmp/all.txt"
   pause
@@ -941,9 +1042,9 @@ sec "REDIRECT PARAMETERS IN THE PAGES"
 # A parameter that decides where the user is sent is the brick session theft is
 # built from: it is reported so it can be looked at by hand.
 redirects="$(grep -Eiao '(\?|&)(url|next|redirect|redirect_uri|return|returnUrl|goto|dest|destination|continue|r)=[^"&<> ]{0,60}' \
-  "$tmp/all.txt" 2>/dev/null | sort -u | head -15)"
+  "$tmp/all.txt" 2>/dev/null | sort -u)"
 if [ -n "$redirects" ]; then
-  printf '%s\n' "$redirects"
+  printf '%s\n' "$redirects" | show_first 15 'redirect parameters are shown: the list is cut'
 else
   echo 'no redirect parameter visible in the pages that were read'
 fi
@@ -956,7 +1057,8 @@ sec "IS THE PANEL PROTECTED"
 # The chain and the headers are the ones already collected above: it is the same
 # request, and asking for it twice would be a request more than the audit needs.
 cat "$tmp/chain-https.txt"
-grep -Ei '^(cf-|set-cookie:[[:space:]]*CF_)' "$tmp/headers.txt" 2>/dev/null | head -10
+grep -Ei '^(cf-|set-cookie:[[:space:]]*CF_)' "$tmp/headers.txt" 2>/dev/null \
+  | show_first 10 'lines are shown: the list is cut'
 printf '[final destination] %s\n' "$home_url"
 
 printf '\n\n##### END OF COLLECTION\n'

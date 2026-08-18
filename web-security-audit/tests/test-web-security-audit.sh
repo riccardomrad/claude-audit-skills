@@ -521,6 +521,22 @@ out="$(cookie_lines 'HTTP/1.1 200 OK
 set-cookie: sid=abc; HttpOnly')"
 contains 'cookies: a cookie that is there is printed'     'sid=abc'        "$out"
 
+# The attributes that decide whether a cookie is safe sit at the END of the
+# line, and a session cookie carrying a token is easily three hundred
+# characters. A fixed cut on the line ate exactly those attributes, so a site
+# that had them right was reported as missing them: a HIGH finding invented by
+# the tool, sent to somebody who would go and "fix" what was never broken.
+long_jwt="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.$(printf 'a%.0s' $(seq 1 260)).sig"
+out="$(cookie_lines "HTTP/1.1 200 OK
+set-cookie: session=$long_jwt; Path=/; HttpOnly; Secure; SameSite=Lax")"
+contains 'cookies: a long cookie keeps HttpOnly' 'HttpOnly' "$out"
+contains 'cookies: a long cookie keeps Secure' 'Secure' "$out"
+contains 'cookies: a long cookie keeps SameSite' 'SameSite=Lax' "$out"
+contains 'cookies: the name of a long cookie survives' 'session=' "$out"
+lacks 'cookies: the token itself is not carried around whole' "$long_jwt" "$out"
+contains 'cookies: and the shortened value says how long it was' 'characters)' "$out"
+
+
 # --- with no reference measurement, everything looks like a finding ----------
 # When the home page could not be read, its size is zero, and a size comparison
 # against zero marks every single 200 as worth looking at: a wall of false
@@ -659,6 +675,180 @@ if [ -n "$server_reader" ] && [ "$server_reader" = "$web_reader" ]; then
 else
   ko=$((ko+1)); printf 'KO    the two copies of the profile reader have drifted apart\n'
 fi
+
+
+echo
+echo '=== TRUNCATION: a cut list always says it was cut ==='
+# A list that stops without saying so reads as a list that ended: the reader is
+# told "these are the headers" having been shown the first fifty out of two
+# hundred. The wording is the one the server collector already uses, so the two
+# bundles say the same thing the same way.
+out="$(printf 'line%s\n' $(seq 1 60) | show_first 40 'lines are shown: the list is cut')"
+contains 'truncation: a cut list says how many lines there were' \
+  'only the first 40 out of 60 lines are shown: the list is cut' "$out"
+expect 'truncation: a cut list still shows the lines it promised' \
+  40 "$(printf '%s\n' "$out" | grep -c '^line')"
+out="$(printf 'line%s\n' $(seq 1 10) | show_first 40 'lines are shown: the list is cut')"
+lacks 'truncation: a list that was not cut says nothing' 'only the first' "$out"
+expect 'truncation: a list that was not cut is printed whole' \
+  10 "$(printf '%s\n' "$out" | grep -c '^line')"
+expect 'truncation: nothing in, nothing out' \
+  '' "$(printf '' | show_first 40 'lines are shown: the list is cut')"
+# Blank lines separate one header block from the next and head counts them:
+# counting only the non empty ones would announce a cut that never happened.
+expect 'truncation: blank lines count as lines, the way head counts them' \
+  '' "$(printf 'a\n\nb\n' | show_first 3 'lines are shown: the list is cut' | grep 'only the first')"
+
+# The six script limit is the cut that costs most. A script that was never
+# downloaded was never searched, and the section right below it would say "no
+# recognisable secret in the pages that were read" having opened six files out
+# of nineteen: a clean bill of health for thirteen files nobody looked at.
+: > "$t/many.html"
+i=1
+while [ "$i" -le 9 ]; do
+  printf '<script src="/s%s.js"></script>' "$i" >> "$t/many.html"
+  i=$((i+1))
+done
+out="$(pick_scripts "$t/many.html" 6 "$t/picked.txt" mysite.test)"
+contains 'truncation: the script limit says how many were left unread' \
+  'only the first 6 out of 9 scripts' "$out"
+contains 'truncation: the script limit says the rest were not read' \
+  'the rest were not' "$out"
+expect 'truncation: the script limit takes exactly six' \
+  6 "$(grep -c . "$t/picked.txt")"
+printf '<script src="/a.js"></script>' > "$t/few.html"
+out="$(pick_scripts "$t/few.html" 6 "$t/picked.txt" mysite.test)"
+lacks 'truncation: a page under the limit says nothing about a cut' \
+  'only the first' "$out"
+expect 'truncation: a page under the limit keeps every script' \
+  1 "$(grep -c . "$t/picked.txt")"
+printf '<p>no script here</p>' > "$t/none.html"
+pick_scripts "$t/none.html" 6 "$t/picked.txt" mysite.test >/dev/null
+expect 'truncation: a page with no script leaves an empty list, not a phantom' \
+  0 "$(grep -c . "$t/picked.txt")"
+
+# The budget of six belongs to the scripts this tool can actually read. A page
+# whose first six script tags point at a CDN is the ordinary shape of the web,
+# and spending the budget on them leaves the secret search with the home page
+# alone while the bundle claims six scripts were taken.
+{
+  printf '<script src="https://cdn.example.com/a%s.js"></script>' 1 2 3 4 5 6
+  printf '<script src="/mine%s.js"></script>' 1 2 3
+} > "$t/cdn.html"
+out="$(pick_scripts "$t/cdn.html" 6 "$t/picked.txt" mysite.test)"
+expect 'truncation: third party scripts do not eat the budget' \
+  3 "$(grep -c . "$t/picked.txt")"
+contains 'truncation: the scripts taken are the ones hosted here' \
+  'https://mysite.test/mine1.js' "$(cat "$t/picked.txt")"
+lacks 'truncation: a third party script is never queued for download' \
+  'cdn.example.com' "$(cat "$t/picked.txt")"
+contains 'truncation: a third party script is listed all the same' \
+  'third party script: listed, NOT downloaded' "$out"
+lacks 'truncation: with nothing cut here there is no cut to announce' \
+  'only the first' "$out"
+
+# Everything above would still pass if the collector stopped calling the
+# helpers and went back to cutting inside the command: the helpers would work
+# perfectly and nobody would use them. These read the call sites.
+file_lacks 'truncation: the home page headers are not cut by a bare head' \
+  'head -50' "$COLLECT"
+file_has 'truncation: the six script limit goes through pick_scripts' \
+  'pick_scripts "\$tmp/home.html" 6' "$COLLECT"
+file_has 'truncation: what the server reveals goes through show_first' \
+  'show_first 12' "$COLLECT"
+file_has 'truncation: the redirect parameters go through show_first' \
+  'show_first 15' "$COLLECT"
+file_has 'truncation: the barrier headers go through show_first' \
+  'show_first 10' "$COLLECT"
+
+# A security header shown cut reads as a header that ends there, and the
+# analyst is asked to judge whether a directive is inside it. A long policy
+# whose frame-ancestors sits past the cut becomes "frame-ancestors is missing":
+# a finding the site does not deserve.
+long_csp="default-src 'self'; $(printf "img-src https://cdn%s.example.com; " $(seq 1 20))frame-ancestors 'none'"
+out="$(header_value 'content-security-policy' "HTTP/1.1 200 OK
+content-security-policy: $long_csp")"
+contains 'truncation: a long header says it was cut' 'was not shown' "$out"
+out="$(header_value 'x-frame-options' "HTTP/1.1 200 OK
+x-frame-options: DENY")"
+contains 'truncation: a short header is returned whole' 'DENY' "$out"
+lacks 'truncation: a short header announces no cut' 'was not shown' "$out"
+
+# Third party scripts are listed and not fetched, but the listing is a list like
+# any other: a page loading sixty CDN scripts used to be bounded by the same
+# head -6 and now has nothing holding it.
+: > "$t/manycdn.html"
+i=1
+while [ "$i" -le 9 ]; do
+  printf '<script src="https://cdn.example.com/x%s.js"></script>' "$i" >> "$t/manycdn.html"
+  i=$((i+1))
+done
+out="$(pick_scripts "$t/manycdn.html" 6 "$t/picked.txt" mysite.test)"
+expect 'truncation: the third party listing is bounded' \
+  6 "$(printf '%s' "$out" | grep -c 'third party script: listed')"
+contains 'truncation: and says how many it did not list' \
+  'only the first 6 out of 9 third party scripts' "$out"
+
+# The same file included ten times is one file, read once. Counting the tags
+# instead of the files announces a cut that never happened and spends six
+# requests on the same address, from a tool that promises not to look like a
+# scan.
+: > "$t/dup.html"
+i=1
+while [ "$i" -le 10 ]; do
+  printf '<script src="/app.js"></script>' >> "$t/dup.html"
+  i=$((i+1))
+done
+out="$(pick_scripts "$t/dup.html" 6 "$t/picked.txt" mysite.test)"
+lacks 'truncation: the same script ten times is not a cut list' \
+  'only the first' "$out"
+expect 'truncation: the same script ten times is downloaded once' \
+  1 "$(grep -c . "$t/picked.txt")"
+
+# The most valuable cut in the whole bundle is the one on the secrets: five
+# masked keys out of forty read as the whole list, in the one section where a
+# reader counts what is there.
+: > "$t/secrets.txt"
+i=1
+while [ "$i" -le 6 ]; do
+  printf 'sk-aaaaaaaaaaaaaaaaaaaa%s
+' "$i" >> "$t/secrets.txt"
+  i=$((i+1))
+done
+out="$(find_secrets "$t/secrets.txt")"
+contains 'truncation: a cut list of secrets says how many there were' \
+  'only the first 5 out of 6' "$out"
+printf 'sk-bbbbbbbbbbbbbbbbbbbb1
+sk-bbbbbbbbbbbbbbbbbbbb2
+' > "$t/few-secrets.txt"
+lacks 'truncation: five secrets or fewer announce no cut' \
+  'only the first' "$(find_secrets "$t/few-secrets.txt")"
+echo
+echo '=== HONESTY: the description matches what the collector does ==='
+# The collector asks for about forty guessed addresses. They are plain reads and
+# they break nothing, but "no fuzzing" is not what trying forty guessed
+# addresses is called, and the promise a skill makes about itself is the one
+# thing nobody can check against the code without reading the code.
+WEB_README="$SKILL/README.md"
+ROOT_README="$SKILL/../README.md"
+lacks 'honesty: the skill no longer promises no fuzzing'   'no fuzzing' "$(cat "$SKILL_MD")"
+file_has 'honesty: the skill declares the fixed list of paths'   'fixed, short list of well known paths' "$SKILL_MD"
+lacks 'honesty: the skill readme no longer promises no fuzzing'   'no fuzzing' "$(cat "$WEB_README")"
+file_has 'honesty: the skill readme declares the fixed list of paths'   'fixed, short list of well known paths' "$WEB_README"
+lacks 'honesty: the repository readme no longer promises no fuzzing' \
+  'no fuzzing' "$(cat "$ROOT_README" 2>/dev/null)"
+# lacks() on an empty haystack always passes, so the line above would go green
+# if that file were renamed or gone. This one only passes when it is read.
+file_has 'honesty: the repository readme declares the fixed list of paths' \
+  'fixed, short list of well known paths' "$ROOT_README"
+# The collector's own header is the version a reader trusts most, because it
+# sits next to the code that does the asking.
+lacks 'honesty: the collector header no longer promises no fuzzing'   'no fuzzing' "$(cat "$COLLECT")"
+file_has 'honesty: the collector header names the fixed list of paths'   'fixed, short list of well known paths' "$COLLECT"
+# There are two guessed lists, not one: the paths, and the directories asked
+# for a listing. Naming one and not the other is the same half truth, smaller.
+file_has 'honesty: the skill names the directory sweep too' \
+  'eight directories' "$SKILL_MD"
 
 echo
 echo '=== FAMILY: no report template may offer a clean bill of health ==='

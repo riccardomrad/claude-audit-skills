@@ -18,8 +18,13 @@ parameters, and whether an exposed panel sits behind a barrier.
 
 ## The read-only promise
 
-GET, HEAD and OPTIONS only. No payloads, no login attempts, no fuzzing, no
-bursts: there is a pause between requests so an audit never looks like a scan.
+GET, HEAD and OPTIONS only. No payloads, no login attempts, no bursts: there is
+a pause between requests so an audit never looks like a scan. It does ask for a
+fixed, short list of well known paths that should not answer (`/.git/HEAD`,
+`/.env`, `/backup.zip`, `/admin`: about forty in all), plus eight directories
+asked for a listing, with plain read requests: that is how a published source
+control directory gets found. Both lists are written in
+`scripts/collect-site.sh` for you to read.
 Scripts hosted by third parties are listed, never fetched, because fetching them
 would be a request to somebody else's site. Secrets found inside pages are
 printed masked (first characters plus length), so the bundle tells you they

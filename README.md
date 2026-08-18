@@ -42,9 +42,13 @@ Nothing here writes, deletes, restarts, installs, or changes configuration.
 - The server collector is piped to `ssh` on standard input, so it is never
   copied onto the machine and leaves nothing behind.
 - The web collector sends GET, HEAD and OPTIONS only. No payloads, no login
-  attempts, no fuzzing, and a pause between requests, so an audit never looks
-  like a scan. Third party scripts are listed, never fetched: fetching them
-  would be a request to somebody else's site.
+  attempts, and a pause between requests, so an audit never looks like a scan.
+  It does ask for a fixed, short list of well known paths that should not answer
+  (`/.git/HEAD`, `/.env`, `/admin`: about forty in all), plus eight directories
+  asked for a listing, with plain read requests: both lists are written in the
+  collector and you can read them. Third
+  party scripts are listed, never fetched: fetching them would be a request to
+  somebody else's site.
 - Secrets are never collected whole. Sensitive files are reported by name,
   owner and mode, never content. A secret found inside a page is printed masked
   (first characters plus length), so the bundle tells you it exists without

@@ -16,7 +16,10 @@ description: >-
   certificate", "web audit", "pen test our own sites", or when they fear a page
   has been tampered with, an old domain is in somebody else's hands, or a new
   customer is about to go live. It makes read requests only: no payloads, no
-  login attempts, no fuzzing, nothing that can break or dirty production, and it
+  login attempts, nothing that can break or dirty production. It does try a
+  fixed, short list of well known paths (a source control directory, an
+  environment file, a database dump, an admin entry point) with plain read
+  requests, and that list is written in the collector for you to read. It
   refuses any host that is not declared in the local audit profile. It is NOT
   the server audit (that is linux-server-audit) and NOT a pre-delivery content
   check.
@@ -47,7 +50,14 @@ sending anything and without trying to get into anywhere.
    password guessing, no bursts of requests, no writes, no real messages pushed
    into a customer's flow. The reason is not only prudence: these systems send
    real messages to real people, and a test that lands in production cannot be
-   undone.
+   undone. It does ask for a fixed, short list of well known paths that should
+   not answer (`/.git/HEAD`, `/.env`, `/backup.zip`, `/admin`: about forty in
+   all), plus eight directories asked for a listing, with plain read requests. Those are the ones that find a source
+   control directory or an environment file published by mistake, which is the
+   most common exposure there is and the one nobody would ever declare, because
+   nobody knows they have it. The list is written in `scripts/collect-site.sh`
+   and you can read it: whoever owns the site is entitled to know exactly which
+   addresses were asked for.
 3. **Secrets are reported, never copied.** If a key ended up inside a page, the
    report says where it is and what it is for, never the value. And validate
    before you alarm anybody: an expired key is not a finding, a working one is
